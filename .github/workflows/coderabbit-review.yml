@@ -1,5 +1,7 @@
 name: CodeRabbit review queue
 on:
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:

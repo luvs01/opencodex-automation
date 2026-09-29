@@ -22,4 +22,4 @@
 
 포크 `dev`에서 workflow를 다시 설치하지 마세요. 큐를 추가로 켜면 저장소 간 concurrency가 공유되지 않습니다. 수동 리뷰 요청은 다음 검사에 반영되지만 정확히 동시에 보낸 요청까지 원자적으로 막는 것은 아닙니다.
 
-Public repository scheduled workflows can be disabled by GitHub after 60 days without repository activity. Check the Actions status when maintaining this queue; it does not create artificial activity commits.
+공개 저장소의 예약 workflow는 저장소 활동이 60일간 없으면 GitHub가 비활성화할 수 있습니다. 관리 시 Actions 상태를 확인해야 합니다. 이를 피하려는 빈 활동 커밋은 만들지 않습니다. [GitHub 정책](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
