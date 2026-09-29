@@ -1,0 +1,46 @@
+name: Queue scheduling watchdog
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_run:
+    workflows: ['Queue tests']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Inspect scheduling without dispatching the queue
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: coderabbit-queue-watchdog
+  cancel-in-progress: false
+jobs:
+  inspect:
+    if: >-
+      github.repository == 'luvs01/opencodex-automation' && github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+        (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.head_repository.full_name == 'luvs01/opencodex-automation'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify logic before recovery
+        run: node --test
+      - name: Recover a missing queue invocation
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ github.token }}
+          retries: 0
+          script: |
+            const {runWatchdog} = await import(`${process.env.GITHUB_WORKSPACE}/scripts/queue-watchdog.mjs`);
+            await runWatchdog({github,context,core,dryRun:context.eventName==='workflow_dispatch' && context.payload.inputs?.dry_run!=='false'});
