@@ -1,0 +1,34 @@
+name: CodeRabbit review queue
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Inspect eligibility without posting a review request
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: coderabbit-opencodex-review-queue
+  cancel-in-progress: false
+jobs:
+  request-review:
+    if: github.repository == 'luvs01/opencodex-automation' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify queue logic
+        run: node --test
+      - name: Inspect or request one eligible review
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ secrets.CODERABBIT_REVIEW_TOKEN }}
+          retries: 0
+          script: |
+            const {data:sender} = await github.rest.users.getAuthenticated();
+            if (sender.login !== 'luvs01' || sender.type === 'Bot') throw new Error('Expected scoped owner user credential');
+            const {run} = await import(`${process.env.GITHUB_WORKSPACE}/scripts/coderabbit-queue.mjs`);
+            await run({github,context,core,dryRun:context.eventName==='workflow_dispatch' && context.payload.inputs?.dry_run!=='false'});
