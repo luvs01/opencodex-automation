@@ -1,0 +1,38 @@
+name: Internal clock bounded probe
+on:
+  workflow_dispatch:
+    inputs:
+      remaining:
+        description: One or two timer invocations; never requests reviews
+        type: choice
+        options: ['2', '1']
+        default: '2'
+      parent_run_id:
+        description: Filled by the previous timer invocation
+        type: string
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: review-clock-probe
+  cancel-in-progress: false
+jobs:
+  tick:
+    if: github.repository == 'luvs01/opencodex-automation' && github.ref == 'refs/heads/main'
+    environment: review-clock-probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ github.token }}
+          retries: 0
+          script: |
+            const {runClock} = await import(`${process.env.GITHUB_WORKSPACE}/scripts/queue-clock.mjs`);
+            await runClock({mode:'probe',github,context,core});
