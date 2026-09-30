@@ -33,7 +33,7 @@ jobs:
         shell: pwsh
         run: |
           if ((git rev-parse HEAD) -ne $env:CANDIDATE_SHA) { throw 'Source mismatch' }
-          bun scripts/release-version-sources.ts check 2.72.0
+          bun scripts/release-version-sources.ts check 2.73.0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -53,7 +53,7 @@ jobs:
         shell: pwsh
         working-directory: desktop
         run: |
-          $config = @{bundle=@{createUpdaterArtifacts=$false;windows=@{wix=@{version='2.72.0'}}}} | ConvertTo-Json -Depth 6 -Compress
+          $config = @{bundle=@{createUpdaterArtifacts=$false;windows=@{wix=@{version='2.73.0'}}}} | ConvertTo-Json -Depth 6 -Compress
           $config | Set-Content -Encoding utf8 -LiteralPath "$env:RUNNER_TEMP/local-candidate.json"
           bunx tauri build --ci --target x86_64-pc-windows-msvc --bundles msi --config "$env:RUNNER_TEMP/local-candidate.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -63,11 +63,11 @@ jobs:
           $msis = @(Get-ChildItem desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi)
           if ($msis.Count -ne 1) { throw 'Expected exactly one candidate MSI' }
           New-Item -ItemType Directory -Path candidate | Out-Null
-          $target = 'candidate/OpenCodex-2.72.0-compat.6079.msi'
+          $target = 'candidate/OpenCodex-2.73.0-compat.6079.msi'
           Copy-Item -LiteralPath $msis[0].FullName -Destination $target
           $digest = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
-          "$digest  OpenCodex-2.72.0-compat.6079.msi" | Set-Content candidate/SHA256SUMS.txt
-          @{sourceCommit=$env:CANDIDATE_SHA;releaseBase='5ab6d52b2a4da722d398e4ab50a6c621ac3ce087';version='2.72.0';customCompatibility=$true;officialRelease=$false;msiSha256=$digest;runId=$env:GITHUB_RUN_ID} | ConvertTo-Json | Set-Content candidate/manifest.json
+          "$digest  OpenCodex-2.73.0-compat.6079.msi" | Set-Content candidate/SHA256SUMS.txt
+          @{sourceCommit=$env:CANDIDATE_SHA;releaseBase='569e3e7dae48bafc54b8a1a7e3a85129befe2d98';version='2.73.0';customCompatibility=$true;officialRelease=$false;msiSha256=$digest;runId=$env:GITHUB_RUN_ID} | ConvertTo-Json | Set-Content candidate/manifest.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: opencodex-windows-candidate
