@@ -14,8 +14,8 @@ test('rerunning an old timer cannot duplicate its child',()=>assert.throws(()=>c
 function fixture(mode='probe') {
   const posts=[];
   const wf={id:9,state:'active'};
-  const env=mode==='probe'?environment:{protection_rules:[{type:'wait_timer',wait_timer:60}]};
-  const own={...run,created_at:new Date(now-(mode==='probe'?61_000:3_601_000)).toISOString()};
+  const env=mode==='probe'?environment:{protection_rules:[{type:'wait_timer',wait_timer:15}]};
+  const own={...run,created_at:new Date(now-(mode==='probe'?61_000:901_000)).toISOString()};
   const actions={getWorkflow:async()=>({data:wf}),getWorkflowRun:async p=>({data:p.run_id===7?own:{...own,id:p.run_id,status:'completed',conclusion:'success'}}),listWorkflowRuns:async()=>({data:{workflow_runs:[own]}}),createWorkflowDispatch:async p=>{posts.push(p)}};
   const summary={addHeading(){return this},addRaw(){return this},async write(){}};
   return {mode,github:{rest:{actions,repos:{getEnvironment:async()=>({data:env})}}},context:{repo:{owner:'luvs01',repo:'opencodex-automation'},ref:'refs/heads/main',eventName:'workflow_dispatch',runId:7,payload:{inputs:{remaining:'2'}}},core:{info(){},summary},clock:()=>now,posts};

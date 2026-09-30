@@ -23,7 +23,19 @@
 - 이 점검은 리뷰 댓글을 작성하지 않습니다. 모든 실제 리뷰 요청은 기존 큐의 concurrency 및 PR 댓글 기반 쿨타임·중복 검사를 다시 거칩니다. 전송 결과가 불명확한 API 요청을 자동 재시도하지 않습니다.
 - 다른 저장소·브랜치, PR 테스트 완료, 실패한 테스트, 리뷰 큐 자체의 완료는 복구 이벤트로 받지 않습니다. 신뢰된 `main` 코드만 실행하고 두 workflow가 서로 반복 호출하는 루프는 만들지 않습니다.
 - 점검 요약에는 마지막 큐 실행 ID, 경과 시간, 복구 호출 여부가 남습니다. workflow를 비활성화해 둔 경우 다시 켜지 않습니다.
-- 별도 예약도 GitHub의 같은 스케줄러를 사용하므로 공통 장애를 해결하거나 정시 실행을 보장하지 않습니다. 주 예약 시간 분산과 별도 점검·테스트 완료 이벤트는 복구 기회를 늘리는 완화책입니다. 장시간 runner를 대기시키거나 자체 호출을 무한 반복하지 않습니다.
+- 별도 예약도 GitHub의 같은 스케줄러를 사용하므로 공통 장애를 해결하거나 정시 실행을 보장하지 않습니다. 주 예약 시간 분산과 별도 점검·테스트 완료 이벤트는 복구 기회를 늘리는 완화책입니다.
+
+## Environment timer fallback
+
+`Internal review clock`은 `schedule`에 의존하지 않는 내부 대안입니다. 시작하면 GitHub Environment의 **15분 wait timer**에서 runner 배정 없이 기다린 뒤, 기존 리뷰 큐와 다음 타이머 실행을 각각 호출합니다. 쿨타임 종료 시점을 놓치지 않도록 15분마다 확인하지만 실제 리뷰 요청은 여전히 기존 큐가 최소 1시간 간격으로 제한합니다.
+
+- Environment `review-clock-quarter-hour`에 `wait_timer: 15`, 관리자 우회 불가, `main` 브랜치만 허용을 설정해야 합니다. 코드는 환경 설정과 실제 경과 시간도 검사하므로 타이머 누락·단축 시 후속 호출을 거부합니다.
+- 기다리는 동안 runner를 점유하지 않습니다. [GitHub wait timer 문서](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#wait-timer)는 이 대기 시간을 과금 시간에 포함하지 않는다고 명시합니다.
+- 각 실행은 짧은 작업 후 종료하고 다음 실행은 새 대기 시간을 거칩니다. `workflow_dispatch`는 `GITHUB_TOKEN`으로 호출해도 후속 실행을 만들 수 있는 [공식 예외](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)입니다. PAT 권한 확대나 외부 타이머가 필요 없습니다.
+- 이미 대기 중인 다른 타이머가 있으면 추가 후속 실행을 만들지 않습니다. 이전 실행 재실행(`Re-run jobs`)은 거부합니다. 전송 결과가 불명확하면 실제 자식 실행을 확인한 뒤 복구해야 합니다.
+- 중지: `Internal review clock` workflow를 비활성화하고 현재 대기 중인 실행을 취소합니다. 리뷰 큐를 비활성화한 경우에도 타이머는 후속 호출을 멈춥니다. 다시 시작할 때 활성 실행이 없는지 확인한 뒤 `parent_run_id`를 비워 수동 실행합니다.
+- 취소, 권한 오류, GitHub Actions 전체 장애 등으로 연결이 끊길 수 있어 무중단 보장은 아닙니다. 주 예약과 watchdog은 별도 복구 경로로 유지합니다. 기존 PR 코드는 실행하지 않습니다.
+- `Internal clock bounded probe`는 별도 1분 환경에서 두 번만 실행되고 종료합니다. probe 자체는 리뷰를 요청하지 않습니다.
 
 ## Operation
 

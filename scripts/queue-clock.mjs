@@ -1,7 +1,7 @@
 const owner = 'luvs01', repo = 'opencodex-automation';
 const modes = {
   probe: {workflow: 'queue-clock-probe.yml', environment: 'review-clock-probe', minutes: 1},
-  live: {workflow: 'queue-clock.yml', environment: 'review-clock-hourly', minutes: 60},
+  live: {workflow: 'queue-clock.yml', environment: 'review-clock-quarter-hour', minutes: 15},
 };
 export function clockPolicy(mode, environment, run, now) {
   const config = modes[mode];
