@@ -35,7 +35,9 @@ export function latestLimit(comments) {
   return comments.map(parseLimit).filter(Boolean).sort((a,b)=>b.at-a.at||b.until-a.until)[0] ?? null;
 }
 export function analyze(pr, comments, reviews, reactions=[], now=Date.now()) {
-  if (pr.state!=='open'||pr.draft||pr.user?.login!==OWNER) return {state:'excluded'};
+  if (pr.state!=='open') return {state:'excluded',exclusionReason:'not-open'};
+  if (pr.user?.login!==OWNER) return {state:'excluded',exclusionReason:'foreign-author'};
+  if (pr.draft) return {state:'excluded',exclusionReason:'draft'};
   const ordered=[...comments].sort((a,b)=>Date.parse(a.created_at)-Date.parse(b.created_at));
   const control=ordered.filter(c=>c.user?.login===OWNER&&/^\s*@coderabbitai\s+(pause|resume)\b/i.test(c.body??'')).at(-1);
   if (/@coderabbitai\s+(?:ignore|pause)\b/i.test(pr.body??'') || (control&&/@coderabbitai\s+pause\b/i.test(control.body))) return {state:'paused'};
@@ -96,6 +98,8 @@ export async function run({github,context,core,dryRun=true,clock=()=>Date.now()}
     }throw new Error('Pagination cap reached; no request');
   }
   async function snapshot(pr){
+    // Keep excluded PRs visible without fetching review history or admitting them.
+    if(analyze(pr,[],[],[],clock()).state==='excluded')return {pr,comments:[],reviews:[],reactions:[]};
     const comments=await pages(github.rest.issues.listComments,{owner,repo,issue_number:pr.number});
     const reviews=await pages(github.rest.pulls.listReviews,{owner,repo,pull_number:pr.number});
     const pending=analyze(pr,comments,reviews,[],clock());let reactions=[];
@@ -105,11 +109,11 @@ export async function run({github,context,core,dryRun=true,clock=()=>Date.now()}
   async function recent(){return pages(github.rest.issues.listCommentsForRepo,{owner,repo,since:new Date(clock()-24*HOUR).toISOString(),sort:'created',direction:'desc'},20);}
   async function finish(result){
     core.info(JSON.stringify(result));
-    const rows=(result.states??[]).map(s=>`#${s.number}: ${s.state}`).join('\n');
+    const rows=(result.states??[]).map(s=>`#${s.number}: ${s.state}${s.exclusionReason?` (${s.exclusionReason})`:''}`).join('\n');
     await core.summary.addHeading('CodeRabbit queue status').addRaw(`${result.reason}; requests posted: ${result.requested}\n${result.nextEligibleAt?`Earliest eligibility: ${result.nextEligibleAt}\n`:''}${rows}`).write();
     return result;
   }
-  const pulls=(await pages(github.rest.pulls.list,{owner,repo,state:'open',sort:'updated',direction:'asc'})).filter(p=>p.user?.login===owner&&!p.draft);
+  const pulls=(await pages(github.rest.pulls.list,{owner,repo,state:'open',sort:'updated',direction:'asc'})).filter(p=>p.user?.login===owner);
   const snapshots=[];for(const pr of pulls)snapshots.push(await snapshot(pr));
   let plan=decide(snapshots,await recent(),clock());
   if(dryRun||!plan.selected)return finish({...plan,dryRun});
