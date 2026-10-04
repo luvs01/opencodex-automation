@@ -56,3 +56,46 @@ test('every repository API call targets the fork, never the controller or upstre
   for(const group of Object.values(f.github.rest))for(const [key,method] of Object.entries(group))group[key]=async p=>{assert.equal(p.owner,'luvs01');assert.equal(p.repo,'opencodex');checked++;return method(p)};
   await run({...f,dryRun:false});assert.equal(f.posts(),1);assert.ok(checked>0);
 });
+
+test('two draft heads are visible with explicit reasons and never posted',async()=>{
+  const f=fixture();let summary='';
+  f.core.summary.addRaw=function(text){summary+=text;return this};
+  f.github.rest.pulls.list=async()=>({data:[{...pr,number:700,draft:true},{...pr,number:701,draft:true}]});
+  const r=await run({...f,dryRun:false});
+  assert.equal(r.reason,'no-eligible-head');
+  assert.deepEqual(r.states.map(s=>[s.number,s.state,s.exclusionReason]),[[700,'excluded','draft'],[701,'excluded','draft']]);
+  assert.match(summary,/#700: excluded \(draft\)/);assert.match(summary,/#701: excluded \(draft\)/);
+  assert.equal(f.posts(),0);assert.ok(!f.calls.includes('comments'));assert.ok(!f.calls.includes('reviews'));
+});
+test('draft skip-review comment cannot masquerade as a running or completed review',()=>{
+  const p={...pr,draft:true};
+  assert.deepEqual(analyze(p,[bot('Draft PR not reviewed')],[],[],now),{state:'excluded',exclusionReason:'draft'});
+  assert.equal(state([bot('Draft PR not reviewed')],pr),'eligible');
+});
+test('draft becoming ready between invocations enters normal eligibility checks',async()=>{
+  const f=fixture();let draft=true;
+  f.github.rest.pulls.list=async()=>({data:[{...pr,draft}]});
+  assert.equal((await run({...f,dryRun:false})).states[0].exclusionReason,'draft');assert.equal(f.posts(),0);
+  draft=false;assert.equal((await run({...f,dryRun:false})).requested,1);assert.equal(f.posts(),1);
+});
+test('ready to draft race prevents external write and reports draft exclusion',async()=>{
+  const f=fixture();f.github.rest.pulls.get=async()=>({data:{...pr,draft:true}});
+  const r=await run({...f,dryRun:false});assert.equal(f.posts(),0);
+  assert.equal(r.reason,'state-changed-before-post');assert.equal(r.states[0].exclusionReason,'draft');
+});
+test('drafts do not block an eligible ready head or bypass global quota',async()=>{
+  const f=fixture();f.github.rest.pulls.list=async()=>({data:[{...pr,number:700,draft:true},pr]});
+  assert.equal((await run({...f,dryRun:false})).requested,1);assert.equal(f.posts(),1);
+  const g=fixture();g.github.rest.pulls.list=f.github.rest.pulls.list;
+  g.github.rest.issues.listCommentsForRepo=async()=>({data:[bot('More reviews will be available in 21 minutes.')]});
+  assert.equal((await run({...g,dryRun:false})).reason,'provider-cooldown');assert.equal(g.posts(),0);
+});
+test('duplicate invocation recovers posted request and does not post twice',async()=>{
+  const f=fixture();assert.equal((await run({...f,dryRun:false})).requested,1);
+  f.github.rest.issues.listComments=async()=>({data:[req(0)]});
+  assert.equal((await run({...f,dryRun:false})).reason,'hourly-cooldown');assert.equal(f.posts(),1);
+});
+test('permission error during listing fails without posting or retrying',async()=>{
+  const f=fixture();let reads=0;f.github.rest.pulls.list=async()=>{reads++;throw Object.assign(Error('Forbidden'),{status:403})};
+  await assert.rejects(run({...f,dryRun:false}),{status:403});assert.equal(reads,1);assert.equal(f.posts(),0);
+});
