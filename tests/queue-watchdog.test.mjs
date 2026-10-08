@@ -1,12 +1,10 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {trustedTrigger, assessQueue, assessClock, runWatchdog} from '../scripts/queue-watchdog.mjs';
+import {trustedTrigger, assessQueue, runWatchdog} from '../scripts/queue-watchdog.mjs';
 const now = Date.parse('2026-09-29T22:00:00Z');
 const workflow = {id: 123, state: 'active'};
-const clockWf = {id: 99, state: 'active'};
 const ctx = {repo:{owner:'luvs01',repo:'opencodex-automation'},ref:'refs/heads/main',eventName:'schedule'};
 const queueRun = (age=20*60_000, overrides={}) => ({id:456,workflow_id:123,head_branch:'main',status:'completed',conclusion:'success',created_at:new Date(now-age).toISOString(),...overrides});
-const clockRun = (age=20*60_000, overrides={}) => ({id:789,workflow_id:99,head_branch:'main',status:'completed',conclusion:'success',created_at:new Date(now-age).toISOString(),...overrides});
 test('disabled workflow remains disabled',()=>assert.equal(assessQueue({...workflow,state:'disabled_manually'},[],now).reason,'queue-disabled'));
 test('all unfinished run states prevent duplicate dispatch',()=>{
   for(const status of ['queued','in_progress','waiting','requested','pending']) assert.equal(assessQueue(workflow,[queueRun(999999,{status})],now).reason,'queue-active');
@@ -27,17 +25,6 @@ test('unrelated workflows and non-main runs do not hide missing main worker',()=
 test('invalid and future timestamps fail closed',()=>{
   for(const created_at of ['invalid',new Date(now+120_000).toISOString()]) assert.throws(()=>assessQueue(workflow,[queueRun(0,{created_at})],now));
 });
-test('a live clock run prevents a duplicate chain',()=>{
-  for(const status of ['queued','in_progress','waiting']) assert.equal(assessClock(clockWf,[clockRun(0,{status})],now).clock,'alive');
-});
-test('a finished chain head means the clock chain is dead and restarts',()=>{
-  assert.equal(assessClock(clockWf,[clockRun(30*60_000)],now).dispatch,true);
-  assert.equal(assessClock(clockWf,[],now).dispatch,true);
-});
-test('a manually stopped clock is reported, never restarted',()=>{
-  for(const conclusion of ['cancelled','action_required']) assert.equal(assessClock(clockWf,[clockRun(0,{conclusion})],now).clock,'stopped');
-});
-test('disabled clock workflow stays off',()=>assert.equal(assessClock({...clockWf,state:'disabled_manually'},[],now).clock,'disabled'));
 test('only expected repository and main branch can trigger recovery',()=>{
   assert.equal(trustedTrigger(ctx),true);
   assert.equal(trustedTrigger({...ctx,ref:'refs/heads/feature'}),false);
@@ -49,44 +36,20 @@ test('test-completion fallback accepts only successful trusted main pushes',()=>
   assert.equal(trustedTrigger(context),true);
   for(const patch of [{event:'pull_request'},{head_branch:'feature'},{conclusion:'failure'},{name:'CodeRabbit review queue'},{head_repository:{full_name:'stranger/repo'}}]) assert.equal(trustedTrigger({...context,payload:{workflow_run:{...pushRun,...patch}}}),false);
 });
-function fixture({queue=[[queueRun()]],clock=[[clockRun(0,{status:'in_progress'})]],issues=[]}={}) {
-  const reads={};const posts=[];const issueWrites=[];
+function fixture(snapshots=[[queueRun()]]) {
+  let reads=0, posts=0;
   const github={rest:{actions:{
-    getWorkflow:async p=>({data:p.workflow_id==='coderabbit-review.yml'?workflow:clockWf}),
-    listWorkflowRuns:async p=>{const arr=p.workflow_id==='coderabbit-review.yml'?queue:clock;const i=reads[p.workflow_id]??0;reads[p.workflow_id]=i+1;return {data:{workflow_runs:arr[Math.min(i,arr.length-1)]??[]}}},
-    createWorkflowDispatch:async p=>{posts.push(p)}
-  },issues:{
-    listForRepo:async()=>({data:issues}),
-    create:async p=>{issueWrites.push(['create',p]);return {data:{number:7}}},
-    createComment:async p=>{issueWrites.push(['comment',p]);return {data:{}}},
-    update:async p=>{issueWrites.push(['update',p]);return {data:{}}}
+    getWorkflow:async()=>({data:workflow}),
+    listWorkflowRuns:async()=>({data:{workflow_runs:snapshots[Math.min(reads++,snapshots.length-1)]}}),
+    createWorkflowDispatch:async p=>{posts++;assert.deepEqual(p,{owner:'luvs01',repo:'opencodex-automation',workflow_id:'coderabbit-review.yml',ref:'main',inputs:{dry_run:'false'}})}
   }}};
   const summary={addHeading(){return this},addRaw(){return this},async write(){}};
-  return {github,context:ctx,core:{info(){},summary},clock:()=>now,posts,issueWrites};
+  return {github,context:ctx,core:{info(){},summary},clock:()=>now,posts:()=>posts};
 }
-test('dry-run never dispatches',async()=>{const f=fixture();assert.equal((await runWatchdog({...f,dryRun:true})).dispatched,false);assert.equal(f.posts.length,0);assert.equal(f.issueWrites.length,0)});
-test('stale queue dispatches exactly once after recheck',async()=>{const f=fixture();assert.equal((await runWatchdog({...f,dryRun:false})).dispatched,true);assert.equal(f.posts.length,1);assert.equal(f.posts[0].workflow_id,'coderabbit-review.yml')});
-test('dead clock restarts with a fresh chain root',async()=>{
-  const f=fixture({queue:[[queueRun(0)]],clock:[[clockRun(30*60_000)]]});
-  const r=await runWatchdog({...f,dryRun:false});
-  assert.equal(r.dispatched,true);assert.equal(f.posts.length,1);
-  assert.equal(f.posts[0].workflow_id,'queue-clock.yml');assert.deepEqual(f.posts[0].inputs,{});
-});
-test('manually stopped clock raises an alert issue instead of a restart',async()=>{
-  const f=fixture({queue:[[queueRun(0)]],clock:[[clockRun(0,{conclusion:'cancelled'})]]});
-  const r=await runWatchdog({...f,dryRun:false});
-  assert.equal(r.dispatched,false);assert.equal(r.alerted,true);
-  assert.equal(f.posts.length,0);assert.equal(f.issueWrites[0][0],'create');
-});
-test('healthy run closes an open alert issue',async()=>{
-  const open={number:5,body:'<!-- ocx-watchdog-alert -->\nold'};
-  const f=fixture({queue:[[queueRun(0)]],issues:[open]});
-  const r=await runWatchdog({...f,dryRun:false});
-  assert.equal(r.alerted,false);assert.deepEqual(r.closed,[5]);
-  assert.equal(f.issueWrites.filter(w=>w[0]==='update').length,1);
-});
-test('worker appearing during final recheck prevents dispatch',async()=>{const f=fixture({queue:[[queueRun()],[queueRun(0,{status:'queued'})]]});await runWatchdog({...f,dryRun:false});assert.equal(f.posts.length,0)});
-test('incomplete history prevents dispatch',async()=>{const f=fixture({queue:[Array(100).fill(queueRun())]});await assert.rejects(runWatchdog({...f,dryRun:false}));assert.equal(f.posts.length,0)});
-test('history pagination reaches a queued run on the next page',async()=>{const f=fixture({queue:[Array(100).fill(queueRun()),[queueRun(0,{status:'queued'})]]});const result=await runWatchdog({...f,dryRun:false});assert.equal(result.reason,'queue-active');assert.equal(f.posts.length,0)});
+test('dry-run never dispatches',async()=>{const f=fixture();assert.equal((await runWatchdog({...f,dryRun:true})).dispatched,false);assert.equal(f.posts(),0)});
+test('stale queue dispatches exactly once after recheck',async()=>{const f=fixture();assert.equal((await runWatchdog({...f,dryRun:false})).dispatched,true);assert.equal(f.posts(),1)});
+test('worker appearing during final recheck prevents dispatch',async()=>{const f=fixture([[queueRun()],[queueRun(0,{status:'queued'})]]);await runWatchdog({...f,dryRun:false});assert.equal(f.posts(),0)});
+test('incomplete history prevents dispatch',async()=>{const f=fixture([Array(100).fill(queueRun())]);await assert.rejects(runWatchdog({...f,dryRun:false}));assert.equal(f.posts(),0)});
+test('history pagination reaches a queued run on the next page',async()=>{const f=fixture([Array(100).fill(queueRun()),[queueRun(0,{status:'queued'})]]);const result=await runWatchdog({...f,dryRun:false});assert.equal(result.reason,'queue-active');assert.equal(f.posts(),0)});
 test('ambiguous dispatch is not retried',async()=>{const f=fixture();let calls=0;f.github.rest.actions.createWorkflowDispatch=async()=>{calls++;throw Error('timeout')};await assert.rejects(runWatchdog({...f,dryRun:false}));assert.equal(calls,1)});
 test('untrusted trigger performs no API access',async()=>{const f=fixture();f.github.rest.actions.getWorkflow=async()=>{throw Error('API must not be called')};await assert.rejects(runWatchdog({...f,context:{...ctx,eventName:'pull_request'}}),/Untrusted/)});
