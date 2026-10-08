@@ -57,16 +57,18 @@ export async function runWatchdog({github, context, core, dryRun = true, clock =
   if (!trustedTrigger(context)) throw new Error('Untrusted watchdog trigger');
   const params = {owner: OWNER, repo: REPO, workflow_id: WORKFLOW};
   const clockParams = {owner: OWNER, repo: REPO, workflow_id: CLOCK_WORKFLOW};
-  async function listRuns(p) {
+  async function listRuns(p, {windowed = true, cap = 10, strict = true} = {}) {
     const runs = [];
-    for (let page = 1; page <= 10; page++) {
-      const {data} = await github.rest.actions.listWorkflowRuns({...p, per_page: 100, page,
-        created: `>=${new Date(clock() - 24 * 60 * 60_000).toISOString()}`});
+    for (let page = 1; page <= cap; page++) {
+      const request = {...p, per_page: 100, page};
+      if (windowed) request.created = `>=${new Date(clock() - 24 * 60 * 60_000).toISOString()}`;
+      const {data} = await github.rest.actions.listWorkflowRuns(request);
       if (!Array.isArray(data.workflow_runs)) throw new Error('Invalid workflow history; no dispatch');
       runs.push(...data.workflow_runs);
       if (data.workflow_runs.length < 100) return runs;
     }
-    throw new Error('Incomplete workflow history; no dispatch');
+    if (strict) throw new Error('Incomplete workflow history; no dispatch');
+    return runs;
   }
   async function inspect() {
     const {data: workflow} = await github.rest.actions.getWorkflow(params);
@@ -76,7 +78,11 @@ export async function runWatchdog({github, context, core, dryRun = true, clock =
   async function inspectClock() {
     const {data: workflow} = await github.rest.actions.getWorkflow(clockParams);
     if (workflow.state !== 'active') return assessClock(workflow, [], clock());
-    return assessClock(workflow, await listRuns(clockParams), clock());
+    // No `created` window here: a manually stopped clock head stays the newest
+    // clock run forever, so unfiltered history keeps it `stopped` — a 24-hour
+    // window would age the cancelled run out and resurrect the chain. Two newest
+    // pages always suffice: the head and any live run are recent by definition.
+    return assessClock(workflow, await listRuns(clockParams, {windowed: false, cap: 2, strict: false}), clock());
   }
   async function finish(result) {
     core.info(JSON.stringify(result));
@@ -86,8 +92,14 @@ export async function runWatchdog({github, context, core, dryRun = true, clock =
   // One open alert issue at a time; it is closed automatically on recovery so the
   // tracker mirrors current health without extra notification plumbing.
   async function alert(problems) {
-    const {data: issues} = await github.rest.issues.listForRepo({owner: OWNER, repo: REPO, state: 'open', per_page: 50});
-    const open = issues.filter(i => (i.body ?? '').includes(ALERT_MARKER) && !i.pull_request);
+    const open = [];
+    for (let page = 1; page <= 5; page++) {
+      const {data} = await github.rest.issues.listForRepo({owner: OWNER, repo: REPO,
+        state: 'open', creator: 'github-actions[bot]', per_page: 100, page});
+      if (!Array.isArray(data)) throw new Error('Invalid issue list; no alert write');
+      open.push(...data.filter(i => (i.body ?? '').includes(ALERT_MARKER) && !i.pull_request));
+      if (data.length < 100) break;
+    }
     if (problems.length) {
       const body = `${ALERT_MARKER}\n\nWatchdog could not recover scheduling on its own:\n\n${problems.map(p => `- ${p}`).join('\n')}\n\nSeen at ${new Date(clock()).toISOString()}.`;
       if (open.length) {

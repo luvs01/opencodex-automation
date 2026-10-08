@@ -78,6 +78,25 @@ test('manually stopped clock raises an alert issue instead of a restart',async()
   assert.equal(r.dispatched,false);assert.equal(r.alerted,true);
   assert.equal(f.posts.length,0);assert.equal(f.issueWrites[0][0],'create');
 });
+test('clock history is read unfiltered so an old cancelled head stays stopped',async()=>{
+  const seen=[];
+  const f=fixture({queue:[[queueRun(0)]],clock:[[clockRun(48*3600_000,{conclusion:'cancelled'})]]});
+  const orig=f.github.rest.actions.listWorkflowRuns;
+  f.github.rest.actions.listWorkflowRuns=async p=>{seen.push(p);return orig(p);};
+  const r=await runWatchdog({...f,dryRun:false});
+  const clockCalls=seen.filter(p=>p.workflow_id==='queue-clock.yml');
+  assert.ok(clockCalls.length>0);assert.ok(clockCalls.every(p=>!('created' in p)));
+  assert.equal(f.posts.length,0);assert.equal(r.alerted,true);
+});
+test('alert lookup paginates bot-created issues past the first page',async()=>{
+  const pages=[[...Array(100).fill({number:1,body:'noise'})],[{number:5,body:'<!-- ocx-watchdog-alert -->\nold'}]];
+  let i=0;
+  const f=fixture({queue:[[queueRun(0)]],clock:[[clockRun(0,{conclusion:'cancelled'})]]});
+  f.github.rest.issues.listForRepo=async p=>{assert.equal(p.creator,'github-actions[bot]');return {data:pages[Math.min(i++,pages.length-1)]}};
+  const r=await runWatchdog({...f,dryRun:false});
+  assert.equal(r.alerted,true);assert.equal(r.issue,5);
+  assert.ok(f.issueWrites.some(w=>w[0]==='comment'&&w[1].issue_number===5));
+});
 test('healthy run closes an open alert issue',async()=>{
   const open={number:5,body:'<!-- ocx-watchdog-alert -->\nold'};
   const f=fixture({queue:[[queueRun(0)]],issues:[open]});

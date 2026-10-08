@@ -104,12 +104,15 @@ test('every repository API call targets the fork, never the controller or upstre
 });
 
 const draftPr={...pr,node_id:'PR_1',draft:true};
+const liftMark=(age,head=pr.head.sha,kind='lift')=>({body:`<!-- ocx-coderabbit-hourly ${kind} head=${head} -->`,user:{login:'luvs01'},created_at:stamp(age),updated_at:stamp(age),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`});
 function lifted(f,{ack='progress'}={}){
   const ready={...pr,node_id:'PR_1',draft:false};
   f.github.rest.pulls.list=async()=>({data:[draftPr]});
   f.github.rest.pulls.get=async()=>({data:ready});
   let polls=0;
-  f.github.rest.issues.listComments=async()=>({data:polls++===0?[]:[ack==='progress'?bot('<!-- review in progress by coderabbit.ai -->'):bot('Draft PR not reviewed')]});
+  // listComments is called by the initial sweep, the post-lift settle check,
+  // then the ack poll — the ack only becomes visible from the poll onward.
+  f.github.rest.issues.listComments=async()=>({data:polls++<2?[]:[ack==='progress'?bot('<!-- review in progress by coderabbit.ai -->'):bot('Draft PR not reviewed')]});
   return f;
 }
 test('draft head is lifted, requested and restored on acknowledgement',async()=>{
@@ -117,9 +120,10 @@ test('draft head is lifted, requested and restored on acknowledgement',async()=>
   f.github.rest.reactions.listForIssueComment=async()=>({data:[{user:{login:'coderabbitai[bot]'},content:'eyes'}]});
   const r=await run({...f,dryRun:false});
   assert.equal(r.requested,1);assert.equal(r.lift,'lift-acknowledged');
-  assert.equal(f.posts(),2);
+  assert.equal(f.posts(),3);
   const gql=f.calls.filter(c=>c==='graphql').length;assert.equal(gql,2);
-  assert.deepEqual([...f.posted.values()].map(b=>b.includes('lift head=')),[true,false]);
+  assert.deepEqual([...f.posted.values()].map(b=>b.includes('lift head=')),[true,false,false]);
+  assert.ok([...f.posted.values()][2].includes('lift-restored'));
 });
 test('a draft refusal still restores the lifted state',async()=>{
   const f=lifted(fixture(),{ack:'refused'});
@@ -143,27 +147,84 @@ test('dry run inspects drafts without lifting',async()=>{
 });
 test('a stale lift marker on a ready PR restores draft state',async()=>{
   const f=fixture();
-  const lift={body:`<!-- ocx-coderabbit-hourly lift head=${pr.head.sha} -->`,user:{login:'luvs01'},created_at:stamp(50*60000),updated_at:stamp(50*60000),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`};
-  f.github.rest.issues.listCommentsForRepo=async()=>({data:[lift]});
+  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000)]});
   const r=await run({...f,dryRun:false});
   assert.deepEqual(r.restored,[1]);
   assert.equal(f.calls.filter(c=>c==='graphql').length,1);
+  assert.equal([...f.posted.values()].filter(b=>b.includes('lift-restored')).length,1);
+});
+test('a lift marker older than the repo-comment window still restores',async()=>{
+  const f=fixture();
+  // The 26-hour-old marker is invisible to `since`-windowed repo comments but
+  // lives on the PR's own thread, which is what restore scans.
+  f.github.rest.issues.listComments=async()=>({data:[liftMark(26*3600000)]});
+  const r=await run({...f,dryRun:false});
+  assert.deepEqual(r.restored,[1]);
 });
 test('review settled on a lifted PR restores it before the grace window',async()=>{
   const f=fixture();
-  const lift={body:`<!-- ocx-coderabbit-hourly lift head=${pr.head.sha} -->`,user:{login:'luvs01'},created_at:stamp(10*60000),updated_at:stamp(10*60000),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`};
-  f.github.rest.issues.listCommentsForRepo=async()=>({data:[lift]});
+  f.github.rest.issues.listComments=async()=>({data:[liftMark(10*60000)]});
   f.github.rest.pulls.listReviews=async()=>({data:[{user:{login:'coderabbitai[bot]'},commit_id:pr.head.sha,submitted_at:stamp(5*60000)}]});
   const r=await run({...f,dryRun:false});
   assert.deepEqual(r.restored,[1]);
 });
-test('global cooldown skips the per-PR sweep but still restores lifted PRs',async()=>{
+test('global cooldown still restores a recently-active lifted PR',async()=>{
   const f=fixture();
-  const lift={body:`<!-- ocx-coderabbit-hourly lift head=${pr.head.sha} -->`,user:{login:'luvs01'},created_at:stamp(50*60000),updated_at:stamp(50*60000),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`};
-  f.github.rest.issues.listCommentsForRepo=async()=>({data:[lift,req(10*60000)]});
+  f.github.rest.pulls.list=async()=>({data:[{...pr,updated_at:stamp(10*60000)}]});
+  f.github.rest.issues.listCommentsForRepo=async()=>({data:[req(10*60000)]});
+  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000)]});
   const r=await run({...f,dryRun:false});
   assert.equal(r.reason,'hourly-cooldown');assert.deepEqual(r.restored,[1]);
-  assert.equal(f.posts(),0);
+  assert.equal(f.posts(),1);
+  assert.ok([...f.posted.values()][0].includes('lift-restored'));
+});
+test('global cooldown defers restore of a long-idle lifted PR to the next sweep',async()=>{
+  const f=fixture();
+  f.github.rest.issues.listCommentsForRepo=async()=>({data:[req(10*60000)]});
+  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000)]});
+  const r=await run({...f,dryRun:false});
+  assert.equal(r.reason,'hourly-cooldown');assert.deepEqual(r.restored,[]);
+  assert.equal(f.posts(),0);assert.equal(f.calls.filter(c=>c==='graphql').length,0);
+});
+test('dry run reports would-restore without writing',async()=>{
+  const f=fixture();
+  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000)]});
+  const r=await run({...f,dryRun:true});
+  assert.deepEqual(r.restored,[]);assert.deepEqual(r.wouldRestore,[1]);
+  assert.equal(f.posts(),0);assert.equal(f.calls.filter(c=>c==='graphql').length,0);
+});
+test('a lift-restored marker sharing the lift marker second still closes the lift',async()=>{
+  const f=fixture();
+  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000),liftMark(50*60000,pr.head.sha,'lift-restored')]});
+  const r=await run({...f,dryRun:false});
+  assert.equal(r.requested,1);
+  assert.equal(f.calls.filter(c=>c==='graphql').length,0);
+});
+test('a target settled during the lift is converted back without a request',async()=>{
+  const f=lifted(fixture());
+  let reads=0;
+  f.github.rest.pulls.listReviews=async()=>({data:reads++===0?[]:[{user:{login:'coderabbitai[bot]'},commit_id:pr.head.sha,submitted_at:stamp(1*60000)}]});
+  const r=await run({...f,dryRun:false});
+  assert.equal(r.requested,0);assert.equal(r.reason,'state-changed-before-post');
+  assert.equal(f.posts(),2);
+  assert.ok([...f.posted.values()][1].includes('lift-restored'));
+});
+test('a consumed lift does not re-restore a manually readied PR',async()=>{
+  const f=fixture();
+  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000),liftMark(40*60000,pr.head.sha,'lift-restored')]});
+  const r=await run({...f,dryRun:false});
+  assert.deepEqual(r.restored,[]);assert.equal(r.requested,1);
+  assert.equal(f.calls.filter(c=>c==='graphql').length,0);
+});
+test('a failed request post still converts a lifted PR back',async()=>{
+  const f=lifted(fixture());let n=0;const orig=f.github.rest.issues.createComment;
+  f.github.rest.issues.createComment=async p=>{n++;if(n===2)throw Error('timeout');return orig(p);};
+  await assert.rejects(run({...f,dryRun:false}));
+  assert.equal(f.calls.filter(c=>c==='graphql').length,2);
+});
+test('three draft refusals on one head need manual review',()=>{
+  const reqs=[req(9*H),req(8*H),req(7*H)].map((r,i)=>({...r,id:100+i}));
+  assert.equal(state([...reqs,bot('Draft PR not reviewed.',30*60000)],{...pr,draft:true}),'needs-manual');
 });
 test('duplicate invocation recovers posted request and does not post twice',async()=>{
   const f=fixture();assert.equal((await run({...f,dryRun:false})).requested,1);

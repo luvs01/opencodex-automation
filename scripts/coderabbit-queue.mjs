@@ -44,7 +44,11 @@ export function markerInfo(c) {
   const body = c.body ?? '';
   if (c.user?.login !== OWNER || !body.includes(MARKER)) return null;
   const head = (body.match(/head=([0-9a-f]{7,40})/i) ?? [])[1]?.toLowerCase() ?? null;
-  return {head, lift: /\blift\b/.test(body), at: Date.parse(c.created_at)};
+  // `lift-restored` closes a lift: later lifts are spaced from the `lift` marker
+  // itself, and a ready PR whose newest lift marker is `lift-restored` was put
+  // back already (or was marked ready by hand) and must not be re-converted.
+  const liftRestored = /\blift-restored\b/.test(body);
+  return {head, lift: !liftRestored && /\blift\b/.test(body), liftRestored, at: Date.parse(c.created_at), id: c.id};
 }
 export function draftRefusal(c) {
   if (c.user?.login !== BOT) return false;
@@ -87,10 +91,18 @@ export function analyze(pr, comments, reviews, reactions=[], now=Date.now()) {
       }
       return limit;
     }).filter(l=>l?.kind==='refusal').sort((a,b)=>b.at-a.at);
-    if (refusals.length) return {state:now<refusals[0].until?'rate-limited':'eligible',requestId:request.id};
+    if (refusals.length) {
+      if (now<refusals[0].until) return {state:'rate-limited',requestId:request.id};
+      // The per-head attempt budget applies to retried refusals as well; without
+      // it a draft refused three times would lift again once the cooldown ends.
+      if (attempts>=REQUESTS_PER_HEAD) return {state:'needs-manual',requestId:request.id,since:at};
+      return {state:pr.draft?'draft-eligible':'eligible',requestId:request.id};
+    }
     if (subsequent.some(draftRefusal)) {
       const until=at+DRAFT_LIFT_COOLDOWN;
-      return now<until?{state:'draft-refused',requestId:request.id,until}:{state:pr.draft?'draft-eligible':'eligible',requestId:request.id};
+      if (now<until) return {state:'draft-refused',requestId:request.id,until};
+      if (attempts>=REQUESTS_PER_HEAD) return {state:'needs-manual',requestId:request.id,since:at};
+      return {state:pr.draft?'draft-eligible':'eligible',requestId:request.id};
     }
     const acknowledged=reactions.some(r=>r.user?.login===BOT&&r.content==='eyes')||subsequent.some(c=>/review (?:triggered|started|queued)/i.test(c.body??''));
     if (acknowledged) {
@@ -153,7 +165,7 @@ export async function run({github,context,core,dryRun=true,clock=()=>Date.now(),
   async function finish(result){
     core.info(JSON.stringify(result));
     const rows=(result.states??[]).map(s=>`#${s.number}: ${s.state}${s.exclusionReason?` (${s.exclusionReason})`:''}`).join('\n');
-    await core.summary.addHeading('CodeRabbit queue status').addRaw(`${result.reason}; requests posted: ${result.requested}\n${result.nextEligibleAt?`Earliest eligibility: ${result.nextEligibleAt}\n`:''}${result.restored?.length?`Draft state restored: ${result.restored.map(n=>'#'+n).join(', ')}\n`:''}${rows}`).write();
+    await core.summary.addHeading('CodeRabbit queue status').addRaw(`${result.reason}; requests posted: ${result.requested}\n${result.nextEligibleAt?`Earliest eligibility: ${result.nextEligibleAt}\n`:''}${result.restored?.length?`Draft state restored: ${result.restored.map(n=>'#'+n).join(', ')}\n`:''}${result.wouldRestore?.length?`Dry-run would restore: ${result.wouldRestore.map(n=>'#'+n).join(', ')}\n`:''}${rows}`).write();
     return result;
   }
   // Draft bypass: temporarily mark a draft PR ready so CodeRabbit accepts the
@@ -170,38 +182,56 @@ export async function run({github,context,core,dryRun=true,clock=()=>Date.now(),
   }
   const pulls=(await pages(github.rest.pulls.list,{owner,repo,state:'open',sort:'updated',direction:'asc'})).filter(p=>p.user?.login===owner);
   const repoComments=await recent();
-  // Ready state is a PR-level flag, not head-scoped: key lift markers by issue
-  // number so a lifted PR is restored even after new commits move its head.
-  const liftMarkers=new Map();
-  for(const c of repoComments){const m=markerInfo(c);const num=Number(c.issue_url?.split('/').pop());if(m?.lift&&Number.isFinite(num)&&m.at<=clock()+60_000)liftMarkers.set(num,Math.max(m.at,liftMarkers.get(num)??0));}
-  const restoreCandidates=pulls.filter(p=>!p.draft&&liftMarkers.has(p.number));
+  // Ready state is a PR-level flag, not head-scoped: lift markers live on the
+  // PR's own comment thread, which is read per candidate so a marker older than
+  // the 24-hour repo-comment window still restores the PR.
+  const restoreCandidates=pulls.filter(p=>!p.draft);
+  function globalCooldown(comments){
+    const limit=latestLimit(comments);
+    const last=comments.filter(isRequest).reduce((n,c)=>Math.max(n,Date.parse(c.created_at)),0);
+    return {until:Math.max(last?last+HOUR:0,limit?.until??0),limit};
+  }
   // Global cooldown from repo-level evidence alone: while it holds there is no
-  // per-PR sweep at all, so idle runs cost two API calls instead of ~3N.
-  const earlyLimit=latestLimit(repoComments);
-  const earlyLast=repoComments.filter(isRequest).reduce((n,c)=>Math.max(n,Date.parse(c.created_at)),0);
-  const globalUntil=Math.max(earlyLast?earlyLast+HOUR:0,earlyLimit?.until??0);
-  async function restoreLifted(snapshots=[]){
-    const restored=[];
+  // per-PR sweep at all, so idle runs cost a handful of API calls instead of ~3N.
+  const {until:globalUntil,limit:earlyLimit}=globalCooldown(repoComments);
+  async function restoreLifted(snapshots=[],{recentOnly=false}={}){
+    const restored=[],wouldRestore=[];
     for(const pr of restoreCandidates){
-      const markerAt=liftMarkers.get(pr.number);
-      const snap=snapshots.find(s=>s.pr.number===pr.number)??await snapshot(pr);
-      const st=analyze(pr,snap.comments,snap.reviews,snap.reactions,clock());
+      // While the global cooldown holds, only PRs with recent activity are
+      // scanned: a just-lifted PR always moves; anything older still restores
+      // on the next full sweep after the cooldown.
+      if(recentOnly&&clock()-Date.parse(pr.updated_at)>=LIFT_RESTORE_GRACE)continue;
+      const snap=snapshots.find(s=>s.pr.number===pr.number);
+      const comments=snap?.comments??await pages(github.rest.issues.listComments,{owner,repo,issue_number:pr.number});
+      let latest=null;
+      // >= on ties: comments arrive oldest-first and two markers can share a
+      // second-granularity timestamp; the later one on the page must win.
+      for(const c of comments){const m=markerInfo(c);if(m&&(m.lift||m.liftRestored)&&m.at<=clock()+60_000&&(!latest||m.at>=latest.at))latest=m;}
+      if(!latest||!latest.lift)continue;
+      const reviews=snap?snap.reviews:await pages(github.rest.pulls.listReviews,{owner,repo,pull_number:pr.number});
+      const reactions=snap?snap.reactions:[];
+      const st=analyze(pr,comments,reviews,reactions,clock());
       // Terminal enough to restore: the review settled, the request was refused,
       // or the marker is simply too old to wait any longer.
       const terminal=['completed','rate-limited','draft-refused','acknowledged','running','needs-manual'].includes(st.state);
-      if(terminal||clock()-markerAt>=LIFT_RESTORE_GRACE){
-        try{await setDraft(pr,true);restored.push(pr.number);}catch(e){core.warning(`Draft restore failed for #${pr.number}: ${e.message??e}`);}
+      if(terminal||clock()-latest.at>=LIFT_RESTORE_GRACE){
+        if(dryRun){wouldRestore.push(pr.number);continue;}
+        try{
+          await setDraft(pr,true);
+          await github.rest.issues.createComment({owner,repo,issue_number:pr.number,body:`<!-- ${MARKER} lift-restored head=${pr.head.sha} -->`});
+          restored.push(pr.number);
+        }catch(e){core.warning(`Draft restore failed for #${pr.number}: ${e.message??e}`);}
       }
     }
-    return restored;
+    return {restored,wouldRestore};
   }
   if(globalUntil>clock()){
-    const restored=await restoreLifted();
-    return finish({requested:0,reason:earlyLimit?.until===globalUntil?'provider-cooldown':'hourly-cooldown',nextEligibleAt:new Date(globalUntil).toISOString(),states:[],restored,dryRun});
+    const {restored,wouldRestore}=await restoreLifted([],{recentOnly:true});
+    return finish({requested:0,reason:earlyLimit?.until===globalUntil?'provider-cooldown':'hourly-cooldown',nextEligibleAt:new Date(globalUntil).toISOString(),states:[],restored,wouldRestore,dryRun});
   }
   const snapshots=[];for(const pr of pulls)snapshots.push(await snapshot(pr));
   let plan=decide(snapshots,repoComments,clock());
-  const restored=await restoreLifted(snapshots);
+  const {restored,wouldRestore}=await restoreLifted(snapshots);
   if(restored.length){
     for(const n of restored){
       const {data:fresh}=await github.rest.pulls.get({owner,repo,pull_number:n});
@@ -210,48 +240,80 @@ export async function run({github,context,core,dryRun=true,clock=()=>Date.now(),
     }
     plan=decide(snapshots,repoComments,clock());
   }
-  if(dryRun||!plan.selected)return finish({...plan,restored,dryRun});
+  if(dryRun||!plan.selected)return finish({...plan,restored,wouldRestore,dryRun});
   const target=snapshots.find(s=>s.pr.number===plan.selected).pr;
   if(target.draft){
-    // Lift -> request -> poll the acknowledgement -> restore. A crash after the
-    // marker leaves the PR ready, which the next run (or the repo's own draft
-    // gate) converts back; a crash before the marker never touches the PR.
+    // Lift -> request -> poll the acknowledgement -> restore. The lift marker is
+    // written BEFORE the state change so a later run can always tell "we lifted
+    // this" apart from "the author marked it ready"; a crash after it leaves the
+    // PR ready, which the next run (or the repo's own draft gate) converts back.
     await github.rest.issues.createComment({owner,repo,issue_number:target.number,body:`<!-- ${MARKER} lift head=${target.head.sha} -->`});
-    liftMarkers.set(target.number,clock());
+    // putBack closes the lift on success too: the `lift-restored` marker keeps
+    // a later manual Ready transition from being converted back to draft.
+    async function putBack(label){
+      try{
+        await setDraft(target,true);
+        try{await github.rest.issues.createComment({owner,repo,issue_number:target.number,body:`<!-- ${MARKER} lift-restored head=${target.head.sha} -->`});}catch(e){core.warning(`Lift-restored marker failed for #${target.number}: ${e.message??e}`);}
+      }catch(e){core.warning(`Draft restore ${label} failed for #${target.number}: ${e.message??e}`);}
+    }
     try{
       await setDraft(target,false);
       const {data:ready}=await github.rest.pulls.get({owner,repo,pull_number:target.number});
-      if(ready.draft)return finish({...plan,selected:null,reason:'lift-blocked',restored});
-    }catch(e){return finish({...plan,selected:null,reason:`lift-failed: ${e.message??e}`,restored});}
-    const body=`@coderabbitai review\n\n<!-- ${MARKER} head=${target.head.sha} -->`;
-    const {data:posted}=await github.rest.issues.createComment({owner,repo,issue_number:target.number,body});
-    const {data:verified}=await github.rest.issues.getComment({owner,repo,comment_id:posted.id});
-    if(verified.body!==body||verified.user?.login!==owner)throw new Error('Owner request readback mismatch');
-    let lift='lift-ack-timeout';
-    const deadline=clock()+LIFT_ACK_WINDOW;
-    while(clock()<deadline){
-      await sleep(LIFT_POLL_MS);
-      const {data:reactions}=await github.rest.reactions.listForIssueComment({owner,repo,comment_id:posted.id});
-      if(reactions.some(r=>r.user?.login===BOT&&r.content==='eyes')){lift='lift-acknowledged';break;}
-      const comments=await pages(github.rest.issues.listComments,{owner,repo,issue_number:target.number});
-      const subsequent=comments.filter(c=>c.user?.login===BOT&&time(c)>=Date.parse(posted.created_at)-5000);
-      if(subsequent.some(c=>/review (?:in progress by coderabbit\.ai|triggered|started|queued)/i.test(c.body??''))){lift='lift-acknowledged';break;}
-      if(subsequent.some(c=>parseLimit(c)||draftRefusal(c))){lift='lift-refused';break;}
+      if(ready.draft){
+        // The fork's draft gate already put it back; still close the lift so a
+        // manual Ready later is not mistaken for a stranded lift.
+        try{await github.rest.issues.createComment({owner,repo,issue_number:target.number,body:`<!-- ${MARKER} lift-restored head=${target.head.sha} -->`});}catch(e){core.warning(`Lift-restored marker failed for #${target.number}: ${e.message??e}`);}
+        return finish({...plan,selected:null,reason:'lift-blocked',restored,wouldRestore});
+      }
+      // Same pre-write gate as the ready path: the head must not have moved and
+      // the hourly budget must still be free before the one external write.
+      if(ready.head.sha!==target.head.sha){await putBack('after head change');return finish({...plan,selected:null,reason:'state-changed-before-post',restored,wouldRestore});}
+      const gate=globalCooldown(await recent());
+      if(gate.until>clock()){await putBack('on cooldown');return finish({...plan,selected:null,reason:gate.limit?.until===gate.until?'provider-cooldown':'hourly-cooldown',restored,wouldRestore});}
+      // And the target itself must still need a request: a review completed or a
+      // pause landing between decide() and the lift makes it unselectable.
+      const settled=await snapshot(ready);
+      if(!SELECTABLE.has(analyze(settled.pr,settled.comments,settled.reviews,settled.reactions,clock()).state)){await putBack('after state change');return finish({...plan,selected:null,reason:'state-changed-before-post',restored,wouldRestore});}
+    }catch(e){
+      // The marker was already posted; whether the PR is ready is unknown.
+      await putBack('after failed lift');
+      return finish({...plan,selected:null,reason:`lift-failed: ${e.message??e}`,restored,wouldRestore});
     }
-    try{await setDraft(target,true);}catch(e){core.warning(`Draft restore after lift failed for #${target.number}: ${e.message??e}`);}
-    return finish({...plan,requested:1,reason:'posted-awaiting-ack',number:target.number,commentId:posted.id,lift,restored});
+    const body=`@coderabbitai review\n\n<!-- ${MARKER} head=${target.head.sha} -->`;
+    let posted=null,lift='lift-ack-timeout';
+    try{
+      const {data:p}=await github.rest.issues.createComment({owner,repo,issue_number:target.number,body});
+      posted=p;
+      const {data:verified}=await github.rest.issues.getComment({owner,repo,comment_id:posted.id});
+      if(verified.body!==body||verified.user?.login!==owner)throw new Error('Owner request readback mismatch');
+      const deadline=clock()+LIFT_ACK_WINDOW;
+      while(clock()<deadline){
+        await sleep(LIFT_POLL_MS);
+        const {data:reactions}=await github.rest.reactions.listForIssueComment({owner,repo,comment_id:posted.id});
+        if(reactions.some(r=>r.user?.login===BOT&&r.content==='eyes')){lift='lift-acknowledged';break;}
+        const comments=await pages(github.rest.issues.listComments,{owner,repo,issue_number:target.number});
+        const subsequent=comments.filter(c=>c.user?.login===BOT&&time(c)>=Date.parse(posted.created_at)-5000);
+        if(subsequent.some(c=>/review (?:in progress by coderabbit\.ai|triggered|started|queued)/i.test(c.body??''))){lift='lift-acknowledged';break;}
+        if(subsequent.some(c=>parseLimit(c)||draftRefusal(c))){lift='lift-refused';break;}
+      }
+    }finally{
+      // Any failure between lift and here still restores the draft state; a
+      // possibly-posted request is recovered from real comments next run.
+      await putBack('after lift');
+    }
+    return finish({...plan,requested:1,reason:'posted-awaiting-ack',number:target.number,commentId:posted.id,lift,restored,wouldRestore});
   }
   // Recheck every candidate and global budget immediately before one external write.
   const fresh=[];
   for(const s of snapshots){const {data:pr}=await github.rest.pulls.get({owner,repo,pull_number:s.pr.number});fresh.push(await snapshot(pr));}
   const final=decide(fresh,await recent(),clock());
-  if(final.selected!==plan.selected||fresh.find(s=>s.pr.number===plan.selected)?.pr.head.sha!==snapshots.find(s=>s.pr.number===plan.selected)?.pr.head.sha)return finish({...final,selected:null,reason:'state-changed-before-post',restored});
+  if(final.selected!==plan.selected||fresh.find(s=>s.pr.number===plan.selected)?.pr.head.sha!==snapshots.find(s=>s.pr.number===plan.selected)?.pr.head.sha)return finish({...final,selected:null,reason:'state-changed-before-post',restored,wouldRestore});
   const pr=fresh.find(s=>s.pr.number===final.selected).pr;
-  if(pr.draft)return finish({...final,selected:null,reason:'state-changed-before-post',restored});
+  if(pr.draft)return finish({...final,selected:null,reason:'state-changed-before-post',restored,wouldRestore});
   const body=`@coderabbitai review\n\n<!-- ${MARKER} head=${pr.head.sha} -->`;
   // No automatic POST retry. Ambiguous outcomes are recovered from actual comments next run.
   const {data:posted}=await github.rest.issues.createComment({owner,repo,issue_number:pr.number,body});
   const {data:verified}=await github.rest.issues.getComment({owner,repo,comment_id:posted.id});
   if(verified.body!==body||verified.user?.login!==owner)throw new Error('Owner request readback mismatch');
-  return finish({...final,requested:1,reason:'posted-awaiting-ack',number:pr.number,commentId:posted.id,restored});
+  return finish({...final,requested:1,reason:'posted-awaiting-ack',number:pr.number,commentId:posted.id,restored,wouldRestore});
 }
