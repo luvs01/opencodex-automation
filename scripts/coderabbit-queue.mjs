@@ -194,13 +194,19 @@ export async function run({github,context,core,dryRun=true,clock=()=>Date.now(),
   // Global cooldown from repo-level evidence alone: while it holds there is no
   // per-PR sweep at all, so idle runs cost a handful of API calls instead of ~3N.
   const {until:globalUntil,limit:earlyLimit}=globalCooldown(repoComments);
-  async function restoreLifted(snapshots=[]){
+  async function restoreLifted(snapshots=[],{recentOnly=false}={}){
     const restored=[],wouldRestore=[];
     for(const pr of restoreCandidates){
+      // While the global cooldown holds, only PRs with recent activity are
+      // scanned: a just-lifted PR always moves; anything older still restores
+      // on the next full sweep after the cooldown.
+      if(recentOnly&&clock()-Date.parse(pr.updated_at)>=LIFT_RESTORE_GRACE)continue;
       const snap=snapshots.find(s=>s.pr.number===pr.number);
       const comments=snap?.comments??await pages(github.rest.issues.listComments,{owner,repo,issue_number:pr.number});
       let latest=null;
-      for(const c of comments){const m=markerInfo(c);if(m&&(m.lift||m.liftRestored)&&m.at<=clock()+60_000&&(!latest||m.at>latest.at))latest=m;}
+      // >= on ties: comments arrive oldest-first and two markers can share a
+      // second-granularity timestamp; the later one on the page must win.
+      for(const c of comments){const m=markerInfo(c);if(m&&(m.lift||m.liftRestored)&&m.at<=clock()+60_000&&(!latest||m.at>=latest.at))latest=m;}
       if(!latest||!latest.lift)continue;
       const reviews=snap?snap.reviews:await pages(github.rest.pulls.listReviews,{owner,repo,pull_number:pr.number});
       const reactions=snap?snap.reactions:[];
@@ -220,7 +226,7 @@ export async function run({github,context,core,dryRun=true,clock=()=>Date.now(),
     return {restored,wouldRestore};
   }
   if(globalUntil>clock()){
-    const {restored,wouldRestore}=await restoreLifted();
+    const {restored,wouldRestore}=await restoreLifted([],{recentOnly:true});
     return finish({requested:0,reason:earlyLimit?.until===globalUntil?'provider-cooldown':'hourly-cooldown',nextEligibleAt:new Date(globalUntil).toISOString(),states:[],restored,wouldRestore,dryRun});
   }
   const snapshots=[];for(const pr of pulls)snapshots.push(await snapshot(pr));
@@ -242,16 +248,32 @@ export async function run({github,context,core,dryRun=true,clock=()=>Date.now(),
     // this" apart from "the author marked it ready"; a crash after it leaves the
     // PR ready, which the next run (or the repo's own draft gate) converts back.
     await github.rest.issues.createComment({owner,repo,issue_number:target.number,body:`<!-- ${MARKER} lift head=${target.head.sha} -->`});
-    async function putBack(label){try{await setDraft(target,true);}catch(e){core.warning(`Draft restore ${label} failed for #${target.number}: ${e.message??e}`);}}
+    // putBack closes the lift on success too: the `lift-restored` marker keeps
+    // a later manual Ready transition from being converted back to draft.
+    async function putBack(label){
+      try{
+        await setDraft(target,true);
+        try{await github.rest.issues.createComment({owner,repo,issue_number:target.number,body:`<!-- ${MARKER} lift-restored head=${target.head.sha} -->`});}catch(e){core.warning(`Lift-restored marker failed for #${target.number}: ${e.message??e}`);}
+      }catch(e){core.warning(`Draft restore ${label} failed for #${target.number}: ${e.message??e}`);}
+    }
     try{
       await setDraft(target,false);
       const {data:ready}=await github.rest.pulls.get({owner,repo,pull_number:target.number});
-      if(ready.draft)return finish({...plan,selected:null,reason:'lift-blocked',restored,wouldRestore});
+      if(ready.draft){
+        // The fork's draft gate already put it back; still close the lift so a
+        // manual Ready later is not mistaken for a stranded lift.
+        try{await github.rest.issues.createComment({owner,repo,issue_number:target.number,body:`<!-- ${MARKER} lift-restored head=${target.head.sha} -->`});}catch(e){core.warning(`Lift-restored marker failed for #${target.number}: ${e.message??e}`);}
+        return finish({...plan,selected:null,reason:'lift-blocked',restored,wouldRestore});
+      }
       // Same pre-write gate as the ready path: the head must not have moved and
       // the hourly budget must still be free before the one external write.
       if(ready.head.sha!==target.head.sha){await putBack('after head change');return finish({...plan,selected:null,reason:'state-changed-before-post',restored,wouldRestore});}
       const gate=globalCooldown(await recent());
       if(gate.until>clock()){await putBack('on cooldown');return finish({...plan,selected:null,reason:gate.limit?.until===gate.until?'provider-cooldown':'hourly-cooldown',restored,wouldRestore});}
+      // And the target itself must still need a request: a review completed or a
+      // pause landing between decide() and the lift makes it unselectable.
+      const settled=await snapshot(ready);
+      if(!SELECTABLE.has(analyze(settled.pr,settled.comments,settled.reviews,settled.reactions,clock()).state)){await putBack('after state change');return finish({...plan,selected:null,reason:'state-changed-before-post',restored,wouldRestore});}
     }catch(e){
       // The marker was already posted; whether the PR is ready is unknown.
       await putBack('after failed lift');
