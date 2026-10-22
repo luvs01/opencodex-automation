@@ -3,7 +3,8 @@ const ACK_GRACE = 10 * 60000;
 const RUNNING_GRACE = 2 * HOUR;
 const QUARANTINE_GRACE = 2 * HOUR;      // un-acknowledged/stale requests retry after this silence
 const REQUESTS_PER_HEAD = 3;            // posted requests per head before manual review is needed
-const DRAFT_LIFT_COOLDOWN = 6 * HOUR;   // spacing between draft-lift attempts on one head
+const DRAFT_LIFT_COOLDOWN = 6 * HOUR;   // spacing after the provider refused a draft review
+const DRAFT_LIFT_RETRY = 30 * 60000;    // spacing after a lift failed before its request
 const LIFT_RESTORE_GRACE = 45 * 60000;  // a lifted PR left ready this long is converted back
 const LIFT_ACK_WINDOW = 4 * 60000;      // in-run acknowledgement poll budget on a lifted PR
 const LIFT_POLL_MS = 15000;
@@ -117,13 +118,21 @@ export function analyze(pr, comments, reviews, reactions=[], now=Date.now()) {
   }
   const changed=Date.parse(pr.updated_at);
   if (!Number.isFinite(changed)) throw new Error('Invalid PR timestamp');
-  if (now-changed<15*60000) return {state:'recent-activity'};
+  const headSha=(pr.head.sha??'').toLowerCase();
+  const lifts=comments.map(markerInfo).filter(m=>m?.lift&&m.head===headSha).sort((a,b)=>b.at-a.at);
+  if (now-changed<15*60000) {
+    // Our own lift already bumped updated_at via its marker and mutations: a
+    // ready PR carrying a fresh lift marker for this head was touched by us,
+    // not externally — without the exemption every lift's settle check rolls
+    // itself back as 'recent-activity'.
+    if (pr.draft || !lifts[0] || now-lifts[0].at>=15*60000) return {state:'recent-activity'};
+  }
   if (pr.draft) {
-    const headSha=(pr.head.sha??'').toLowerCase();
-    const lifts=comments.map(markerInfo).filter(m=>m?.lift&&m.head===headSha).sort((a,b)=>b.at-a.at);
     if (lifts.length>=REQUESTS_PER_HEAD) return {state:'needs-manual'};
-    // A marker without a following request means the last lift failed before posting.
-    if (lifts[0] && now-lifts[0].at<DRAFT_LIFT_COOLDOWN) return {state:'draft-lift-failed',until:lifts[0].at+DRAFT_LIFT_COOLDOWN};
+    // A marker without a following request means the last lift failed before
+    // posting. That consumed no request budget, so retries pace tighter than a
+    // provider draft refusal; REQUESTS_PER_HEAD still bounds total attempts.
+    if (lifts[0] && now-lifts[0].at<DRAFT_LIFT_RETRY) return {state:'draft-lift-failed',until:lifts[0].at+DRAFT_LIFT_RETRY};
     return {state:'draft-eligible'};
   }
   return {state:'eligible'};
