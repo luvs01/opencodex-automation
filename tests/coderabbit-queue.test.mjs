@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {isRequest,parseLimit,latestLimit,analyze,decide,run} from '../scripts/coderabbit-queue.mjs';
+import {isRequest,isAdmission,markerInfo,parseLimit,latestLimit,analyze,decide,run} from '../scripts/coderabbit-queue.mjs';
 const H=3600000, now=Date.parse('2026-09-29T12:20:00Z'), stamp=(age)=>new Date(now-age).toISOString();
 const pr={number:1,state:'open',draft:false,user:{login:'luvs01'},head:{sha:'a'.repeat(40)},updated_at:stamp(2*H),body:''};
 const bot=(body,age=0)=>({body,user:{login:'coderabbitai[bot]',type:'Bot'},created_at:stamp(age),updated_at:stamp(age)});
@@ -65,21 +65,20 @@ test('draft refusal cools down then permits another lift',()=>{
   const old=[req(9*H),bot('Draft PR not reviewed.',8*H)];
   assert.equal(state(old,{...pr,draft:true}),'draft-eligible');
 });
-test('failed lift marker spaces retries but a stale one does not block',()=>{
-  const lift=(age,head=pr.head.sha)=>({body:`<!-- ocx-coderabbit-hourly lift head=${head} -->`,user:{login:'luvs01'},created_at:stamp(age),updated_at:stamp(age),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`});
-  assert.equal(state([lift(10*60000)],{...pr,draft:true}),'draft-lift-failed');
-  assert.equal(state([lift(31*60000)],{...pr,draft:true}),'draft-eligible');
-  assert.equal(state([lift(10*60000,'b'.repeat(40))],{...pr,draft:true}),'draft-eligible');
-  assert.equal(state([lift(9*H),lift(8*H),lift(7*H)],{...pr,draft:true}),'needs-manual');
+test('trig markers count as admission like posted requests',()=>{
+  const trig=(age,head=pr.head.sha)=>({body:`<!-- ocx-coderabbit-hourly trig head=${head} -->`,user:{login:'luvs01'},created_at:stamp(age),updated_at:stamp(age),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`});
+  assert.equal(isAdmission(trig(0)),true);
+  assert.equal(markerInfo(trig(0))?.trig,true);
+  assert.equal(isRequest(trig(0)),false);
+  assert.equal(state([trig(5*60000)]),'awaiting-ack');
+  assert.equal(state([trig(70*60000)]),'quarantined-unacknowledged');
+  assert.equal(state([trig(3*H)]),'retry-eligible');
+  assert.equal(state([trig(3*H,'b'.repeat(40))]),'eligible');
+  assert.equal(state([trig(9*H),trig(8*H),trig(7*H)]),'needs-manual');
 });
-test('a just-lifted ready head is not quarantined by its own lift activity',()=>{
-  const lift=(age,head=pr.head.sha)=>({body:`<!-- ocx-coderabbit-hourly lift head=${head} -->`,user:{login:'luvs01'},created_at:stamp(age),updated_at:stamp(age),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`});
-  const fresh={...pr,updated_at:stamp(60000)};
-  assert.equal(state([lift(60000)],fresh),'eligible');
-  // An external bump still defers: stale or foreign-head markers do not exempt.
-  assert.equal(state([lift(20*60000)],fresh),'recent-activity');
-  assert.equal(state([lift(60000,'b'.repeat(40))],fresh),'recent-activity');
-  assert.equal(state([lift(60000)],{...fresh,draft:true}),'recent-activity');
+test('our own trig admission is not hidden by the updated_at bump',()=>{
+  const trig={body:`<!-- ocx-coderabbit-hourly trig head=${pr.head.sha} -->`,user:{login:'luvs01'},created_at:stamp(1000),updated_at:stamp(1000)};
+  assert.equal(state([trig],{...pr,updated_at:stamp(1000)}),'awaiting-ack');
 });
 test('active review holds whole queue',()=>assert.equal(decide([snap(pr,[bot('<!-- review in progress by coderabbit.ai -->')]),snap({...pr,number:2})],[],now).reason,'running'));
 test('stale review is isolated not blindly repeated',()=>assert.equal(decide([snap(pr,[bot('<!-- review in progress by coderabbit.ai -->',3*H)]),snap({...pr,number:2})],[],now).selected,2));
@@ -92,6 +91,7 @@ function fixture(){
       listCommentsForRepo:api('recent',()=>[]),
       listComments:api('comments',()=>[]),
       createComment:api('post',p=>{posts++;const id=100+posts;posted.set(id,p.body);return {id,body:p.body,created_at:new Date(t).toISOString()}}),
+      updateComment:api('edit',p=>{posted.set(p.comment_id,p.body);return {id:p.comment_id,body:p.body}}),
       getComment:api('getComment',p=>({user:{login:'luvs01'},body:posted.get(p.comment_id)??''}))
     },pulls:{list:api('pulls',()=>[pr]),listReviews:api('reviews',()=>[]),get:api('get',()=>pr)},reactions:{listForIssueComment:api('reactions',()=>[])}}
   };
@@ -113,134 +113,68 @@ test('every repository API call targets the fork, never the controller or upstre
 });
 
 const draftPr={...pr,node_id:'PR_1',draft:true};
-const liftMark=(age,head=pr.head.sha,kind='lift')=>({body:`<!-- ocx-coderabbit-hourly ${kind} head=${head} -->`,user:{login:'luvs01'},created_at:stamp(age),updated_at:stamp(age),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`});
-function lifted(f,{ack='progress'}={}){
-  const ready={...pr,node_id:'PR_1',draft:false};
-  f.github.rest.pulls.list=async()=>({data:[draftPr]});
-  f.github.rest.pulls.get=async()=>({data:ready});
-  let polls=0;
-  // listComments is called by the initial sweep, the post-lift settle check,
-  // then the ack poll — the ack only becomes visible from the poll onward.
-  f.github.rest.issues.listComments=async()=>({data:polls++<2?[]:[ack==='progress'?bot('<!-- review in progress by coderabbit.ai -->'):bot('Draft PR not reviewed')]});
+const skipBox=(age=H)=>({id:55,body:`<!-- skip review by coderabbit.ai -->\n> - [ ] <!-- {"checkboxId":"cb-1"} --> 🔍 Trigger review`,user:{login:'coderabbitai[bot]'},created_at:stamp(age),updated_at:stamp(age)});
+function trigged(f,{draft=true}={}){
+  const target=draft?{...pr,node_id:'PR_1',draft:true}:pr;
+  f.github.rest.pulls.list=async()=>({data:[target]});
+  f.github.rest.pulls.get=async()=>({data:target});
+  let reads=0;
+  // Sweep and final recheck see the skip-review box; the ack poll additionally
+  // sees CodeRabbit's progress comment.
+  f.github.rest.issues.listComments=async()=>({data:++reads<3?[skipBox()]:[skipBox(),bot('<!-- review in progress by coderabbit.ai -->')]});
   return f;
 }
-test('draft head is lifted, requested and restored on acknowledgement',async()=>{
-  const f=lifted(fixture());
-  f.github.rest.reactions.listForIssueComment=async()=>({data:[{user:{login:'coderabbitai[bot]'},content:'eyes'}]});
+test('a draft with a trigger box is toggled and marker-posted without PR mutations',async()=>{
+  const f=trigged(fixture());
   const r=await run({...f,dryRun:false});
-  assert.equal(r.requested,1);assert.equal(r.lift,'lift-acknowledged');
-  assert.equal(f.posts(),3);
-  const gql=f.calls.filter(c=>c==='graphql').length;assert.equal(gql,2);
-  assert.deepEqual([...f.posted.values()].map(b=>b.includes('lift head=')),[true,false,false]);
-  assert.ok([...f.posted.values()][2].includes('lift-restored'));
-});
-test('a draft refusal still restores the lifted state',async()=>{
-  const f=lifted(fixture(),{ack:'refused'});
-  const r=await run({...f,dryRun:false});
-  assert.equal(r.requested,1);assert.equal(r.lift,'lift-refused');
-  assert.equal(f.calls.filter(c=>c==='graphql').length,2);
-});
-test('our own lift bumping updated_at does not roll the request back',async()=>{
-  const f=lifted(fixture());
-  // Real GitHub bumps updated_at on the marker comment and the mutations.
-  f.github.rest.pulls.get=async()=>({data:{...pr,node_id:'PR_1',draft:false,updated_at:stamp(0)}});
-  let reads=0;
-  // Sweep sees nothing; the settle check sees only our marker; the ack poll
-  // sees the marker plus CodeRabbit's progress comment.
-  f.github.rest.issues.listComments=async()=>{const n=++reads;return{data:n===1?[]:n===2?[liftMark(1000)]:[liftMark(1000),bot('<!-- review in progress by coderabbit.ai -->')]};};
-  const r=await run({...f,dryRun:false});
-  assert.equal(r.requested,1);assert.equal(r.lift,'lift-acknowledged');
-});
-test('a failed lift posts the marker only and cools down via it',async()=>{
-  const f=fixture();
-  f.github.rest.pulls.list=async()=>({data:[draftPr]});
-  f.github.graphql=async()=>{throw Error('Resource not accessible')};
-  const r=await run({...f,dryRun:false});
-  assert.equal(f.posts(),1);assert.equal(r.requested,0);assert.match(r.reason,/lift-failed/);
-});
-test('dry run inspects drafts without lifting',async()=>{
-  const f=fixture();
-  f.github.rest.pulls.list=async()=>({data:[draftPr]});
-  const r=await run({...f,dryRun:true});
-  assert.equal(r.states[0].state,'draft-eligible');assert.equal(f.posts(),0);
-  assert.equal(f.calls.filter(c=>c==='graphql').length,0);
-});
-test('a stale lift marker on a ready PR restores draft state',async()=>{
-  const f=fixture();
-  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000)]});
-  const r=await run({...f,dryRun:false});
-  assert.deepEqual(r.restored,[1]);
-  assert.equal(f.calls.filter(c=>c==='graphql').length,1);
-  assert.equal([...f.posted.values()].filter(b=>b.includes('lift-restored')).length,1);
-});
-test('a lift marker older than the repo-comment window still restores',async()=>{
-  const f=fixture();
-  // The 26-hour-old marker is invisible to `since`-windowed repo comments but
-  // lives on the PR's own thread, which is what restore scans.
-  f.github.rest.issues.listComments=async()=>({data:[liftMark(26*3600000)]});
-  const r=await run({...f,dryRun:false});
-  assert.deepEqual(r.restored,[1]);
-});
-test('review settled on a lifted PR restores it before the grace window',async()=>{
-  const f=fixture();
-  f.github.rest.issues.listComments=async()=>({data:[liftMark(10*60000)]});
-  f.github.rest.pulls.listReviews=async()=>({data:[{user:{login:'coderabbitai[bot]'},commit_id:pr.head.sha,submitted_at:stamp(5*60000)}]});
-  const r=await run({...f,dryRun:false});
-  assert.deepEqual(r.restored,[1]);
-});
-test('global cooldown still restores a recently-active lifted PR',async()=>{
-  const f=fixture();
-  f.github.rest.pulls.list=async()=>({data:[{...pr,updated_at:stamp(10*60000)}]});
-  f.github.rest.issues.listCommentsForRepo=async()=>({data:[req(10*60000)]});
-  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000)]});
-  const r=await run({...f,dryRun:false});
-  assert.equal(r.reason,'hourly-cooldown');assert.deepEqual(r.restored,[1]);
+  assert.equal(r.requested,1);assert.equal(r.trigger,'trigger-acknowledged');
   assert.equal(f.posts(),1);
-  assert.ok([...f.posted.values()][0].includes('lift-restored'));
+  assert.ok([...f.posted.values()][0].includes('trig head='));
+  assert.equal(f.calls.filter(c=>c==='graphql').length,0);
+  assert.equal(f.calls.filter(c=>c==='edit').length,1);
 });
-test('global cooldown defers restore of a long-idle lifted PR to the next sweep',async()=>{
-  const f=fixture();
-  f.github.rest.issues.listCommentsForRepo=async()=>({data:[req(10*60000)]});
-  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000)]});
+test('a draft without a trigger box reports no surface instead of lifting',async()=>{
+  const f=trigged(fixture());
+  f.github.rest.issues.listComments=async()=>({data:[]});
   const r=await run({...f,dryRun:false});
-  assert.equal(r.reason,'hourly-cooldown');assert.deepEqual(r.restored,[]);
-  assert.equal(f.posts(),0);assert.equal(f.calls.filter(c=>c==='graphql').length,0);
+  assert.equal(r.requested,0);assert.equal(r.reason,'no-trigger-surface');
+  assert.equal(f.posts(),0);assert.equal(f.calls.filter(c=>c==='edit').length,0);
 });
-test('dry run reports would-restore without writing',async()=>{
-  const f=fixture();
-  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000)]});
-  const r=await run({...f,dryRun:true});
-  assert.deepEqual(r.restored,[]);assert.deepEqual(r.wouldRestore,[1]);
-  assert.equal(f.posts(),0);assert.equal(f.calls.filter(c=>c==='graphql').length,0);
-});
-test('a lift-restored marker sharing the lift marker second still closes the lift',async()=>{
-  const f=fixture();
-  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000),liftMark(50*60000,pr.head.sha,'lift-restored')]});
+test('a ready head prefers the checkbox over a comment request',async()=>{
+  const f=trigged(fixture(),{draft:false});
   const r=await run({...f,dryRun:false});
   assert.equal(r.requested,1);
-  assert.equal(f.calls.filter(c=>c==='graphql').length,0);
+  assert.equal(f.posts(),1);assert.ok([...f.posted.values()][0].includes('trig head='));
 });
-test('a target settled during the lift is converted back without a request',async()=>{
-  const f=lifted(fixture());
-  let reads=0;
-  f.github.rest.pulls.listReviews=async()=>({data:reads++===0?[]:[{user:{login:'coderabbitai[bot]'},commit_id:pr.head.sha,submitted_at:stamp(1*60000)}]});
+test('a ready head without a box falls back to a comment request',async()=>{
+  const f=trigged(fixture(),{draft:false});
+  f.github.rest.issues.listComments=async()=>({data:[]});
   const r=await run({...f,dryRun:false});
-  assert.equal(r.requested,0);assert.equal(r.reason,'state-changed-before-post');
-  assert.equal(f.posts(),2);
-  assert.ok([...f.posted.values()][1].includes('lift-restored'));
+  assert.equal(r.requested,1);assert.equal(f.posts(),1);
+  assert.ok([...f.posted.values()][0].includes('@coderabbitai review'));
 });
-test('a consumed lift does not re-restore a manually readied PR',async()=>{
-  const f=fixture();
-  f.github.rest.issues.listComments=async()=>({data:[liftMark(50*60000),liftMark(40*60000,pr.head.sha,'lift-restored')]});
+test('a re-rendered box acknowledges the trigger without new comments',async()=>{
+  const f=trigged(fixture());
+  let gl=0;
+  f.github.rest.issues.getComment=async p=>({data:{id:p.comment_id,user:{login:'luvs01'},body:++gl===1?'- [x] <!-- {"checkboxId":"cb-1"} --> 🔍 Trigger review':'- [ ] <!-- {"checkboxId":"cb-1"} --> Check again to try again'}});
   const r=await run({...f,dryRun:false});
-  assert.deepEqual(r.restored,[]);assert.equal(r.requested,1);
-  assert.equal(f.calls.filter(c=>c==='graphql').length,0);
+  assert.equal(r.requested,1);assert.equal(r.trigger,'trigger-acknowledged');
 });
-test('a failed request post still converts a lifted PR back',async()=>{
-  const f=lifted(fixture());let n=0;const orig=f.github.rest.issues.createComment;
-  f.github.rest.issues.createComment=async p=>{n++;if(n===2)throw Error('timeout');return orig(p);};
-  await assert.rejects(run({...f,dryRun:false}));
-  assert.equal(f.calls.filter(c=>c==='graphql').length,2);
+test('a refused trigger reports the refusal',async()=>{
+  const f=trigged(fixture());
+  f.github.rest.issues.listComments=async()=>({data:[skipBox(),bot('Draft PR not reviewed. Please mark ready for review.')]});
+  const r=await run({...f,dryRun:false});
+  assert.equal(r.requested,1);assert.equal(r.trigger,'trigger-refused');
+});
+test('dry run inspects drafts without toggling',async()=>{
+  const f=trigged(fixture());
+  const r=await run({...f,dryRun:true});
+  assert.equal(r.states[0].state,'draft-eligible');assert.equal(f.posts(),0);
+  assert.equal(f.calls.filter(c=>c==='edit').length,0);
+});
+test('legacy lift markers are ignored by the trigger path',()=>{
+  const lift={body:`<!-- ocx-coderabbit-hourly lift head=${pr.head.sha} -->`,user:{login:'luvs01'},created_at:stamp(50*60000),updated_at:stamp(50*60000)};
+  assert.equal(state([lift]),'eligible');
 });
 test('three draft refusals on one head need manual review',()=>{
   const reqs=[req(9*H),req(8*H),req(7*H)].map((r,i)=>({...r,id:100+i}));
