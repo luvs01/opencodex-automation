@@ -5,24 +5,26 @@
 ## CodeRabbit review queue
 
 - 대상은 `luvs01/opencodex`의 `luvs01` 작성, 열린 PR(초안 포함)만입니다. 상류 PR이나 이 관리 저장소 PR에는 리뷰를 요청하지 않습니다.
-- 매시 2·7·12·…·57분에 자격을 확인하도록 예약하며, 마지막 사용자 리뷰 요청으로부터 최소 1시간 및 CodeRabbit이 알려준 쿨타임을 모두 지킵니다. GitHub 예약 실행은 지연될 수 있어 정확한 시각을 보장하지 않습니다.
-- 한 번에 하나만 요청합니다. 진행 중인 리뷰, 미확인 요청, 동일 HEAD 완료, pause/ignore, 최근 변경을 구분하며, 불명확한 POST는 자동 재시도하지 않습니다.
+- 매시 2·7·12·…·57분에 자격을 확인하도록 예약하며, 마지막 사용자 리뷰 요청으로부터 최소 1시간 및 CodeRabbit이 알려준 쿨타임 중 늦은 시각을 지킵니다. 1시간은 대상 포크 [#736](https://github.com/luvs01/opencodex/pull/736#issuecomment-6158411001)·[#737](https://github.com/luvs01/opencodex/pull/737#issuecomment-6256858477)의 실제 CodeRabbit 응답에서 확인된 포함 리뷰 한도입니다. 일반 요금제 문구로 이 포크의 한도를 높이지 않습니다. GitHub 예약 실행은 지연될 수 있어 정확한 시각을 보장하지 않습니다.
+- 한 번에 하나만 요청합니다. 진행 중인 리뷰, 미확인 요청, 동일 HEAD 완료, pause/ignore를 구분하며, 불명확한 POST/PATCH는 자동 재시도하지 않습니다. 댓글·봇 응답으로도 바뀌는 PR `updated_at`에는 별도의 15분 대기를 적용하지 않습니다. 전송 직전 현재 HEAD와 상태·쿨타임을 다시 확인합니다.
 - 쿨타임과 요청 상태는 대상 PR의 실제 댓글·리뷰·반응에서 복구하므로 포크 동기화, runner 재시작, 자동화 이관으로 초기화되지 않습니다.
 - Actions 요약에서 이유, PR별 상태, 다음 요청 가능 시각을 확인합니다. 수동 실행은 기본 `dry_run=true`입니다.
-- 무응답 요청은 영구 보류하지 않습니다. ack 후 2시간 또는 무반응 2시간이 지나면 동일 HEAD 기준 최대 3회까지 자동 재요청하고, 초과하면 `needs-manual`로 표시합니다.
+- 기존 댓글 명령은 ack 후 2시간 또는 무반응 2시간이 지나면 동일 HEAD 기준 최대 3회까지 자동 재요청하고, 초과하면 `needs-manual`로 표시합니다. checkbox 요청은 수락 근거가 없으면 `trigger-pending`으로 유지하며 자동 재전송하지 않습니다. 진행·거부 등 독립적인 봇 근거가 확인된 요청에는 기존 대기·재시도 한도를 적용합니다.
 
-### Draft PR lift 우회
+### Manual review checkbox
 
-- Draft PR은 `draft-eligible`로 선택되면 **리프트 마커 댓글을 먼저 남기고** `markPullRequestReadyForReview` GraphQL 뮤테이션으로 일시 Ready 전환한 뒤, Ready를 확인하고 리뷰 명령을 보냅니다. 마커를 먼저 남기므로 중간에 실행이 끊겨도 다음 실행이 "우리가 띄운 상태"인지 구분할 수 있습니다.
-- 요청 후 최대 4분간 15초 간격으로 CodeRabbit의 눈 반응·진행 댓글·거부를 확인하고, 그 다음 `convertPullRequestToDraft`로 되돌립니다. Ready 상태 자체가 CodeRabbit의 자동 리뷰를 유발할 수도 있습니다.
-- 포크의 `enforce-pr-target` 게이트가 Ready 즉시 다시 Draft로 돌리면 `lift-blocked`로 기록하고 요청을 보내지 않습니다. 마커만 남은 실패(`lift-failed`·`lift-blocked`)는 동일 HEAD 기준 6시간 후 재시도합니다.
-- 어떤 이유로든 리프트 마커가 남은 PR이 Ready로 남아 있으면 다음 실행이 자동 복귀합니다: 리뷰가 정착(완료·진행·거부·수동 처리)했거나 마커가 45분을 넘으면 `convertPullRequestToDraft`로 되돌립니다. 복귀는 글로벌 쿨타임 중에도 수행합니다.
-- CodeRabbit이 `Draft PR not reviewed` 등으로 명시 거부하면 그 요청은 소진으로 간주하고 동일 HEAD 기준 6시간 후에만 다시 띄웁니다. HEAD별 리프트 3회까지, 이후는 `needs-manual`입니다.
+- CodeRabbit 본인 댓글의 `Trigger a manual review`, 기존 `Trigger review`, `Check again to try again` checkbox를 인식합니다. `Autofix` 등 다른 checkbox는 건드리지 않습니다. 초안 상태는 유지하며 GraphQL 상태 변경을 사용하지 않습니다.
+- 먼저 HEAD별 `trig` 마커를 남기고 해당 checkbox 하나를 선택합니다. 마커에는 편집 전 봇 댓글 ID와 관련 신호의 최소 비교 정보를 기록합니다. 최신 유효 버튼 댓글 전체가 이전 버튼을 대체하며, 최신 버튼이 체크돼 있으면 `trigger-control-checked`로 보류합니다. 이 경우 이전 버튼이나 Ready PR의 명령 댓글로 우회하지 않습니다. 실행 가능한 버튼이 없는 초안은 `no-trigger-surface`로 표시하고 다음 후보를 검사합니다. Ready PR에 버튼 자체가 없을 때만 기존 사용자 리뷰 명령 댓글을 사용합니다.
+- 즉시 readback한 뒤 최대 4분간 15초 간격으로 실제 봇 진행·완료·거부를 확인합니다. 거부를 먼저 판정하며, 요청 이전의 댓글 내용이나 다른 HEAD의 신호는 수락 근거로 쓰지 않습니다. checkbox가 빠르게 해제돼도 오류로 단정하지 않고 독립적인 근거를 확인합니다. 버튼 소실·문구 변경·체크 해제만으로 수락을 확정하지 않습니다.
+- PATCH 결과가 불명확하면 마커를 보존하고 실제 댓글을 읽어 확인합니다. 동일 PATCH나 대체 명령을 자동으로 보내지 않습니다. 이 상태는 다음 실행에서도 `trigger-pending`으로 복구됩니다.
+- 확인된 진행·완료는 HEAD·근거 댓글/리뷰 ID·관측 시각을 자체 마커에 저장하고 readback합니다. 후속 저장이 실패하거나 불명확해도 최초 마커의 비교 정보로 오래된 봇 댓글에 새로 추가된 진행 신호를 복구하여 확인된 리뷰의 2시간 보호를 유지합니다. 우리의 checkbox 편집으로 수정 시각만 바뀐 기존 문구는 새 근거가 되지 않습니다. 근거 없는 `trigger-pending`을 전역 진행 상태로 간주하지는 않습니다.
+- API가 checkbox 편집을 명시적으로 거부하면 `trig-rejected`로 마커를 수정하고 readback합니다. 이 기록은 리뷰 소진으로 계산하지 않으며, 해당 HEAD는 `trigger-write-rejected`로 자동 재시도에서 제외합니다. 거부 기록의 저장 결과까지 불명확하면 기존 마커를 보수적으로 보류합니다.
+- CodeRabbit이 요청 후 `Draft PR not reviewed` 등으로 명시 거부하면 동일 HEAD 기준 6시간 후에만 재시도합니다. provider 제한 응답은 그 응답의 재시도 시각을 지키며 HEAD별 최대 3회 이후 `needs-manual`로 표시합니다.
 - 이 큐는 CodeRabbit 리뷰 요청을 관리합니다. 리뷰 지적에 대한 코드 수정이나 스레드 답변·해결은 별도 작업입니다.
 
 ## Credential and isolation
 
-관리 저장소의 Actions secret `CODERABBIT_REVIEW_TOKEN`은 `luvs01`의 fine-grained PAT입니다. **접근 대상 저장소는 `luvs01/opencodex` 하나**, 권한은 **Pull requests: read/write**, Metadata: read만 필요합니다. Pull requests: write는 Draft lift의 `markPullRequestReadyForReview`/`convertPullRequestToDraft` GraphQL 뮤테이션과 리뷰 요청 댓글에 함께 사용합니다. 관리 저장소에 대한 쓰기 권한은 필요 없습니다. 토큰은 채팅이나 소스에 기록하지 않습니다.
+관리 저장소의 Actions secret `CODERABBIT_REVIEW_TOKEN`은 `luvs01`의 fine-grained PAT입니다. **접근 대상 저장소는 `luvs01/opencodex` 하나**이며, 댓글·checkbox 편집용 **Issues: read/write**, PR·리뷰 조회용 **Pull requests: read**, Metadata: read를 사용합니다. Draft lift용 Pull requests: write/GraphQL 권한은 사용하지 않습니다. 관리 저장소에 대한 쓰기 권한은 필요 없습니다. 토큰은 채팅이나 소스에 기록하지 않습니다. 이 문서 변경은 실제 토큰·권한을 변경하지 않습니다.
 
 실제 리뷰 요청은 봇이 아닌 사용자 인증으로 전송됩니다. 실행 시 로그인 주체를 검증합니다. 리뷰 workflow의 기본 `GITHUB_TOKEN`은 관리 저장소 읽기에만 사용합니다. 아래 점검 workflow만 관리 저장소의 `actions: write` 권한으로 기존 큐를 호출합니다. 기존 PAT의 권한은 확대하지 않습니다. 리뷰 workflow는 `main`의 schedule/manual에서만 실행하며, PR 이벤트는 secret 없는 테스트만 수행합니다. 대상 PR의 코드를 가져오거나 실행하지 않습니다.
 
