@@ -1,0 +1,85 @@
+name: Native macOS validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character luvs01/opencodex commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'luvs01/opencodex-automation' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate request
+        id: request
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'source_sha must be exactly 40 lowercase hexadecimal characters' >&2
+            exit 2
+          fi
+          printf 'source_sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout OpenCodex source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: luvs01/opencodex
+          ref: ${{ steps.request.outputs.source_sha }}
+          path: opencodex
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Bun 1.4.3
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Verify platform, runtime, source SHA, and declared Bun version
+        id: runtime
+        shell: bash
+        working-directory: opencodex
+        env:
+          EXPECTED_SHA: ${{ steps.request.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          platform="$(uname -s)"
+          bun_version="$(bun --version)"
+          declared_version="$(node -p "require('./package.json').testRunnerBun")"
+          printf 'platform=%s\n' "$platform"
+          printf 'bun_version=%s\n' "$bun_version"
+          printf 'source_sha=%s\n' "$actual_sha"
+          [[ "$platform" == Darwin ]]
+          [[ "$actual_sha" == "$EXPECTED_SHA" ]]
+          [[ "$bun_version" == 1.4.3 ]]
+          [[ "$declared_version" == "$bun_version" ]]
+          {
+            printf '### Native macOS validation\n\n'
+            printf -- '- Platform: `%s`\n- Bun: `%s`\n- Source SHA: `%s`\n' "$platform" "$bun_version" "$actual_sha"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install root dependencies
+        working-directory: opencodex
+        run: bun install --frozen-lockfile
+
+      - name: Run messaging remote-store integration test
+        shell: bash
+        working-directory: opencodex
+        run: |
+          set +e
+          bun run scripts/test.ts --parallel=1 --timeout=30000 ./tests/codex-integration/messaging-remote-store.test.ts
+          test_exit_code=$?
+          set -e
+          printf 'test_exit_code=%s\n' "$test_exit_code"
+          printf '\nTest command exit code: `%s`\n' "$test_exit_code" >> "$GITHUB_STEP_SUMMARY"
+          exit "$test_exit_code"

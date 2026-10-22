@@ -55,6 +55,19 @@
 
 `node --test`로 네트워크 없이 회귀 검사를 수행합니다. workflow 비활성화로 자동 요청을 중단할 수 있습니다. 비활성화는 이미 시작된 CodeRabbit 리뷰를 취소하지 않습니다. 토큰 만료·취소는 실패로 표시되며 bot credential로 우회하지 않습니다.
 
+## Native macOS test
+
+`Native macOS validation`은 저장소 `main`에서만 수동 실행할 수 있습니다. 정확한 `luvs01/opencodex` commit SHA를 입력하면 격리된 GitHub-hosted macOS runner에서 `tests/codex-integration/messaging-remote-store.test.ts` 하나만 실행합니다. 저장소에 설정된 secret을 전달하지 않으며 source checkout 자격 증명을 보존하지 않습니다. 결과 요약에는 Darwin, Bun 버전, checkout SHA와 테스트 exit code가 기록됩니다.
+
+```sh
+SOURCE_SHA=0123456789abcdef0123456789abcdef01234567
+gh workflow run native-macos-validation.yml \
+  --repo luvs01/opencodex-automation --ref main \
+  -f "source_sha=$SOURCE_SHA"
+```
+
+사용을 중단하려면 저장소의 Actions 화면에서 `Native macOS validation` workflow를 비활성화합니다. 다시 사용할 때 같은 화면에서 활성화할 수 있습니다.
+
 포크 `dev`에서 workflow를 다시 설치하지 마세요. 큐를 추가로 켜면 저장소 간 concurrency가 공유되지 않습니다. 수동 리뷰 요청은 다음 검사에 반영되지만 정확히 동시에 보낸 요청까지 원자적으로 막는 것은 아닙니다.
 
 공개 저장소의 예약 workflow는 저장소 활동이 60일간 없으면 GitHub가 비활성화할 수 있습니다. 관리 시 Actions 상태를 확인해야 합니다. 이를 피하려는 빈 활동 커밋은 만들지 않습니다. [GitHub 정책](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
