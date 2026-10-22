@@ -67,10 +67,19 @@ test('draft refusal cools down then permits another lift',()=>{
 });
 test('failed lift marker spaces retries but a stale one does not block',()=>{
   const lift=(age,head=pr.head.sha)=>({body:`<!-- ocx-coderabbit-hourly lift head=${head} -->`,user:{login:'luvs01'},created_at:stamp(age),updated_at:stamp(age),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`});
-  assert.equal(state([lift(2*H)],{...pr,draft:true}),'draft-lift-failed');
-  assert.equal(state([lift(7*H)],{...pr,draft:true}),'draft-eligible');
-  assert.equal(state([lift(2*H,'b'.repeat(40))],{...pr,draft:true}),'draft-eligible');
+  assert.equal(state([lift(10*60000)],{...pr,draft:true}),'draft-lift-failed');
+  assert.equal(state([lift(31*60000)],{...pr,draft:true}),'draft-eligible');
+  assert.equal(state([lift(10*60000,'b'.repeat(40))],{...pr,draft:true}),'draft-eligible');
   assert.equal(state([lift(9*H),lift(8*H),lift(7*H)],{...pr,draft:true}),'needs-manual');
+});
+test('a just-lifted ready head is not quarantined by its own lift activity',()=>{
+  const lift=(age,head=pr.head.sha)=>({body:`<!-- ocx-coderabbit-hourly lift head=${head} -->`,user:{login:'luvs01'},created_at:stamp(age),updated_at:stamp(age),issue_url:`https://api.github.com/repos/luvs01/opencodex/issues/${pr.number}`});
+  const fresh={...pr,updated_at:stamp(60000)};
+  assert.equal(state([lift(60000)],fresh),'eligible');
+  // An external bump still defers: stale or foreign-head markers do not exempt.
+  assert.equal(state([lift(20*60000)],fresh),'recent-activity');
+  assert.equal(state([lift(60000,'b'.repeat(40))],fresh),'recent-activity');
+  assert.equal(state([lift(60000)],{...fresh,draft:true}),'recent-activity');
 });
 test('active review holds whole queue',()=>assert.equal(decide([snap(pr,[bot('<!-- review in progress by coderabbit.ai -->')]),snap({...pr,number:2})],[],now).reason,'running'));
 test('stale review is isolated not blindly repeated',()=>assert.equal(decide([snap(pr,[bot('<!-- review in progress by coderabbit.ai -->',3*H)]),snap({...pr,number:2})],[],now).selected,2));
@@ -130,6 +139,17 @@ test('a draft refusal still restores the lifted state',async()=>{
   const r=await run({...f,dryRun:false});
   assert.equal(r.requested,1);assert.equal(r.lift,'lift-refused');
   assert.equal(f.calls.filter(c=>c==='graphql').length,2);
+});
+test('our own lift bumping updated_at does not roll the request back',async()=>{
+  const f=lifted(fixture());
+  // Real GitHub bumps updated_at on the marker comment and the mutations.
+  f.github.rest.pulls.get=async()=>({data:{...pr,node_id:'PR_1',draft:false,updated_at:stamp(0)}});
+  let reads=0;
+  // Sweep sees nothing; the settle check sees only our marker; the ack poll
+  // sees the marker plus CodeRabbit's progress comment.
+  f.github.rest.issues.listComments=async()=>{const n=++reads;return{data:n===1?[]:n===2?[liftMark(1000)]:[liftMark(1000),bot('<!-- review in progress by coderabbit.ai -->')]};};
+  const r=await run({...f,dryRun:false});
+  assert.equal(r.requested,1);assert.equal(r.lift,'lift-acknowledged');
 });
 test('a failed lift posts the marker only and cools down via it',async()=>{
   const f=fixture();
